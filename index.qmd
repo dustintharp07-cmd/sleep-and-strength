@@ -1,0 +1,554 @@
+---
+title: "Sleep & Strength"
+---
+
+```{r}
+library(tidyverse)
+library(plotly)
+library(jsonlite)
+
+df <- read_rds("data/processed/nhanes_sleep_strength.rds")
+sample_flow <- read_csv("data/processed/sample_flow.csv", show_col_types = FALSE)
+
+# Summary metrics for hero KPI cards
+n_total <- nrow(df)
+mean_sleep <- round(mean(df$sleep_hours), 2)
+mean_grip <- round(mean(df$combined_grip_kg), 1)
+median_grip <- round(median(df$combined_grip_kg), 1)
+pct_rec_sleep <- round(mean(df$sleep_hours %in% c(7, 8)) * 100, 1)
+
+# Prepare Lifespan x Sleep surface matrices (All, Male, Female)
+df_binned <- df |>
+  mutate(
+    age_band = cut(
+      age,
+      breaks = c(15, 24, 34, 44, 54, 64, 74, 85),
+      labels = c("16–24", "25–34", "35–44", "45–54", "55–64", "65–74", "75–80+")
+    ),
+    sleep_bin = case_when(
+      sleep_hours <= 4 ~ "≤4h",
+      sleep_hours == 5 ~ "5h",
+      sleep_hours == 6 ~ "6h",
+      sleep_hours == 7 ~ "7h",
+      sleep_hours == 8 ~ "8h",
+      sleep_hours == 9 ~ "9h",
+      sleep_hours >= 10 ~ "10+h"
+    ) |> factor(levels = c("≤4h", "5h", "6h", "7h", "8h", "9h", "10+h"))
+  )
+
+build_surface_payload <- \(sub_df) {
+  grid <- expand_grid(
+    sleep_bin = levels(df_binned$sleep_bin),
+    age_band = levels(df_binned$age_band)
+  ) |>
+    mutate(
+      sleep_bin = factor(sleep_bin, levels = levels(df_binned$sleep_bin)),
+      age_band = factor(age_band, levels = levels(df_binned$age_band))
+    )
+
+  stats <- sub_df |>
+    group_by(sleep_bin, age_band) |>
+    summarise(
+      n = n(),
+      mean_grip = round(mean(combined_grip_kg), 1),
+      median_grip = round(median(combined_grip_kg), 1),
+      iqr_grip = round(IQR(combined_grip_kg), 1),
+      .groups = "drop"
+    )
+
+  full <- grid |>
+    left_join(stats, by = c("sleep_bin", "age_band")) |>
+    arrange(sleep_bin, age_band)
+
+  z_mat <- matrix(
+    full$mean_grip,
+    nrow = length(levels(df_binned$sleep_bin)),
+    ncol = length(levels(df_binned$age_band)),
+    byrow = TRUE
+  )
+
+  txt_mat <- matrix(
+    paste0(
+      "<b>Age Band:</b> ", full$age_band,
+      "<br><b>Nightly Sleep:</b> ", full$sleep_bin,
+      "<br><b>Mean Combined Grip:</b> ", full$mean_grip, " kg",
+      "<br><b>Median (IQR):</b> ", full$median_grip, " kg (", full$iqr_grip, " kg)",
+      "<br><b>Participants:</b> n = ", full$n
+    ),
+    nrow = length(levels(df_binned$sleep_bin)),
+    ncol = length(levels(df_binned$age_band)),
+    byrow = TRUE
+  )
+
+  # Peak sleep bin per age band (requiring n >= 10 for stability)
+  peaks <- full |>
+    filter(!is.na(mean_grip), n >= 10) |>
+    group_by(age_band) |>
+    slice_max(order_by = mean_grip, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    arrange(age_band)
+
+  list(
+    x = levels(df_binned$age_band),
+    y = levels(df_binned$sleep_bin),
+    z = z_mat,
+    hover = txt_mat,
+    peak_x = as.character(peaks$age_band),
+    peak_y = as.character(peaks$sleep_bin),
+    peak_z = peaks$mean_grip
+  )
+}
+
+surface_data <- list(
+  All = build_surface_payload(df_binned),
+  Male = build_surface_payload(df_binned |> filter(sex == "Male")),
+  Female = build_surface_payload(df_binned |> filter(sex == "Female"))
+)
+
+# Prepare all 10,987 points + empirical quantiles for Lens B
+set.seed(2026)
+pts_df <- df |>
+  mutate(
+    sleep_jitter = round(sleep_hours + runif(n(), -0.32, 0.32), 2),
+    grip = round(combined_grip_kg, 1)
+  )
+
+quantiles_by_hour <- df |>
+  group_by(sleep_hours) |>
+  summarise(
+    n = n(),
+    p10 = round(quantile(combined_grip_kg, 0.10), 1),
+    p25 = round(quantile(combined_grip_kg, 0.25), 1),
+    p50 = round(quantile(combined_grip_kg, 0.50), 1),
+    mean_g = round(mean(combined_grip_kg), 1),
+    p75 = round(quantile(combined_grip_kg, 0.75), 1),
+    p90 = round(quantile(combined_grip_kg, 0.90), 1),
+    .groups = "drop"
+  )
+
+hero_payload_json <- toJSON(
+  list(
+    surface = surface_data,
+    points = list(
+      x = pts_df$sleep_jitter,
+      raw_h = pts_df$sleep_hours,
+      y = pts_df$grip,
+      age = pts_df$age,
+      sex = as.character(pts_df$sex),
+      cat = as.character(pts_df$sleep_category)
+    ),
+    quantiles = quantiles_by_hour
+  ),
+  auto_unbox = TRUE
+)
+
+# Include plotly dependency cleanly via a hidden zero-height widget
+dep_widget <- plot_ly() |>
+  config(displayModeBar = FALSE) |>
+  htmlwidgets::onRender("function(el) { el.style.display = 'none'; }")
+```
+
+```{r}
+dep_widget
+```
+
+```{=html}
+<div class="platform-shell">
+
+  <!-- HERO SECTION -->
+  <section class="hero-section">
+    <div class="eyebrow-badge">
+      CDC NHANES 2011–2014 &middot; Ages 16 to 80+ &middot; Observational Research Platform
+    </div>
+    <h1 class="hero-title">
+      Rest &amp; Resilience: <span class="gradient-text">Sleep Duration and Physical Strength</span> Across the Human Lifespan
+    </h1>
+    <p class="hero-subtitle">
+      An interactive empirical investigation of <strong>10,987 U.S. adolescents, working-age adults, and older adults (ages 16–80+)</strong> examining how nightly sleep habits align with objective bilateral handgrip strength.
+    </p>
+
+    <div class="rq-callout">
+      <div class="rq-label">Central Research Question</div>
+      <p class="rq-question">
+        How is sleep duration associated with physical strength, and does this relationship differ across age groups?
+      </p>
+      <p class="rq-note">
+        Observational note: NHANES is a cross-sectional population survey. Associations documented here describe real-world population patterns and do not establish causal effects.
+      </p>
+    </div>
+  </section>
+
+  <!-- KPI METRICS -->
+  <section class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpi-label">Validated Sample</div>
+      <div class="kpi-value accent-cyan">10,987</div>
+      <div class="kpi-sub">Complete sleep &amp; bilateral grip exams across 2011–2014</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Age Coverage</div>
+      <div class="kpi-value accent-violet">16–80+ yrs</div>
+      <div class="kpi-sub">Youth (16+), prime working-age, and older adulthood</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Mean Nightly Sleep</div>
+      <div class="kpi-value accent-blue">6.91 hrs</div>
+      <div class="kpi-sub">54.3% report the recommended 7–8 hours/night</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Combined Grip Strength</div>
+      <div class="kpi-value accent-teal">70.8 kg</div>
+      <div class="kpi-sub">Mean sum of max left + right hand dynamometry (median 67.0 kg)</div>
+    </div>
+  </section>
+
+  <!-- PRIMARY FLAGSHIP VISUALIZATION -->
+  <section class="glass-card">
+    <div class="section-header">
+      <div>
+        <div class="section-kicker">Primary Empirical Architecture &middot; N = 10,987</div>
+        <h2 class="section-title">The Lifespan &times; Sleep Strength Landscape</h2>
+        <p class="section-desc" id="hero-chart-caption">
+          Smoothed topographic strength surface across seven life-stage bands (ages 16–80+) and seven sleep-duration tiers. Hover any cell for exact sample counts, means, and interquartile ranges, or switch to inspect all 10,987 individual participants.
+        </p>
+      </div>
+      <div class="control-bar">
+        <button class="pill-btn active" id="lens-surface-btn" onclick="setHeroLens('surface')">
+          Topographic Landscape
+        </button>
+        <button class="pill-btn" id="lens-cloud-btn" onclick="setHeroLens('cloud')">
+          All 10,987 Observations + Quantiles
+        </button>
+      </div>
+    </div>
+
+    <div class="control-bar" id="sex-toggle-bar" style="margin-bottom: 0.9rem;">
+      <span style="font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; color: #94a3b8; margin-right: 0.35rem; font-weight: 700;">Cohort Slice:</span>
+      <button class="pill-btn active" id="sex-All" onclick="setSurfaceSex('All')">All Participants (10,987)</button>
+      <button class="pill-btn" id="sex-Male" onclick="setSurfaceSex('Male')">Males (5,420)</button>
+      <button class="pill-btn" id="sex-Female" onclick="setSurfaceSex('Female')">Females (5,567)</button>
+    </div>
+
+    <div id="hero-flagship-plot" style="width: 100%; height: 520px;"></div>
+  </section>
+
+  <!-- DATASET & METHODOLOGY -->
+  <section class="glass-card" id="dataset-methodology">
+    <div class="section-kicker">Data Provenance &amp; Measurement</div>
+    <h2 class="section-title">CDC NHANES 2011–2014 Dataset &amp; Variables</h2>
+    <p class="section-desc">
+      Data combine two consecutive waves of the U.S. National Health and Nutrition Examination Survey (<strong>2011–2012 Cycle G</strong> and <strong>2013–2014 Cycle H</strong>), merging demographics, self-reported sleep questionnaires (administered to participants aged 16 and older), and Mobile Examination Center (MEC) isometric grip dynamometry.
+    </p>
+
+    <div class="info-grid-3">
+      <div class="mini-panel">
+        <span class="code-tag">SLD010H &middot; Sleep Questionnaire</span>
+        <h4>Nightly Sleep Duration</h4>
+        <p style="font-size: 0.88rem; color: #94a3b8; margin: 0;">
+          Self-reported usual weekday/workday sleep hours (integer values 2 through 12+, with NHANES codes <code>77</code> Refused and <code>99</code> Don't Know recoded as missing). Categorized into Very Short (&le;5h), Short (6h), Recommended (7–8h), and Long (9+h).
+        </p>
+      </div>
+      <div class="mini-panel">
+        <span class="code-tag">MGDCGSZ &middot; Takei Dynamometer</span>
+        <h4>Combined Grip Strength (kg)</h4>
+        <p style="font-size: 0.88rem; color: #94a3b8; margin: 0;">
+          Objective upper-body isometric muscle strength measured across three trials per hand. Defined by CDC protocol as the sum of the largest reading from each hand (ranging from 8.0 kg to 169.6 kg in our validated sample).
+        </p>
+      </div>
+      <div class="mini-panel">
+        <span class="code-tag">RIDAGEYR &amp; RIAGENDR &middot; Demographics</span>
+        <h4>Age Across the Lifespan (16–80+)</h4>
+        <p style="font-size: 0.88rem; color: #94a3b8; margin: 0;">
+          Covers late adolescence through older adulthood: ages 16–29 (n = 2,959), 30–44 (n = 2,592), 45–59 (n = 2,422), 60–74 (n = 2,118), and 75–80+ (n = 896; CDC top-codes ages 80 and over at 80).
+        </p>
+      </div>
+    </div>
+
+    <div style="margin-top: 1.4rem;">
+      <h4 style="font-size: 0.95rem; color: #e2e8f0; margin-bottom: 0.35rem;">Sample Validation &amp; Filtering Accounting</h4>
+      <table class="dark-table">
+        <thead>
+          <tr>
+            <th>Processing Stage</th>
+            <th style="text-align: right;">Participants (N)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Total NHANES 2011–2014 survey respondents (<code>DEMO_G</code> + <code>DEMO_H</code>)</td>
+            <td style="text-align: right;">19,931</td>
+          </tr>
+          <tr>
+            <td>Sleep Disorders Questionnaire respondents aged 16+ (<code>SLQ_G</code> + <code>SLQ_H</code>)</td>
+            <td style="text-align: right;">12,639</td>
+          </tr>
+          <tr>
+            <td>Muscle Strength Dynamometry examinees aged 6+ (<code>MGX_G</code> + <code>MGX_H</code>)</td>
+            <td style="text-align: right;">16,112</td>
+          </tr>
+          <tr>
+            <td>Merged across Demographics + Sleep + Grip modules by <code>SEQN</code> (ages 16+ in MEC)</td>
+            <td style="text-align: right;">12,185</td>
+          </tr>
+          <tr>
+            <td>Excluded due to missing, refused (<code>77</code>), or unknown (<code>99</code>) sleep hours</td>
+            <td style="text-align: right;">&minus;24</td>
+          </tr>
+          <tr>
+            <td>Excluded due to incomplete bilateral grip test (missing <code>MGDCGSZ</code>)</td>
+            <td style="text-align: right;">&minus;1,174</td>
+          </tr>
+          <tr>
+            <td>Final Validated Analytical Dataset (<code>nhanes_sleep_strength.rds</code>)</td>
+            <td style="text-align: right;">10,987</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- NAVIGATION PORTALS -->
+  <section class="info-grid-2">
+    <a class="nav-portal-card" href="explore.html">
+      <div class="section-kicker">Interactive Laboratory</div>
+      <h3 style="font-size: 1.3rem; font-weight: 700; color: #f8fafc; margin: 0.2rem 0 0.5rem 0;">
+        Explore the Data Across Age, Sleep &amp; Demographics
+      </h3>
+      <p style="font-size: 0.92rem; color: #94a3b8; margin: 0;">
+        Slice all 10,987 observations in real time by sleep category, age group (16–29 through 75–80+), sex, race/ethnicity, reported sleep trouble, and grip metric.
+      </p>
+      <span class="portal-arrow">Launch Interactive Explorer &rarr;</span>
+    </a>
+
+    <a class="nav-portal-card" href="story.html">
+      <div class="section-kicker" style="color: #a78bfa;">Narrative Synthesis (Reserved)</div>
+      <h3 style="font-size: 1.3rem; font-weight: 700; color: #f8fafc; margin: 0.2rem 0 0.5rem 0;">
+        From Athletic Recovery to Lifelong Strength
+      </h3>
+      <p style="font-size: 0.92rem; color: #94a3b8; margin: 0;">
+        Visit the reserved Story section outlining how athletic performance questions expand into lifelong physical functioning across adulthood.
+      </p>
+      <span class="portal-arrow" style="color: #a78bfa;">View Story Blueprint &rarr;</span>
+    </a>
+  </section>
+
+</div>
+```
+
+```{r}
+#| results: asis
+cat(paste0("<script>const HERO_DATA = ", hero_payload_json, ";</script>\n"))
+```
+
+```{=html}
+<script>
+let currentLens = "surface";
+let currentSex = "All";
+
+function renderHeroSurface() {
+  const d = HERO_DATA.surface[currentSex];
+  const colorscale = [
+    [0.0, "#131836"],
+    [0.25, "#3b2d71"],
+    [0.50, "#0e7490"],
+    [0.75, "#22d3ee"],
+    [1.0, "#2dd4bf"]
+  ];
+
+  const heatTrace = {
+    type: "heatmap",
+    x: d.x,
+    y: d.y,
+    z: d.z,
+    text: d.hover,
+    hoverinfo: "text",
+    zsmooth: "best",
+    colorscale: colorscale,
+    colorbar: {
+      title: { text: "Mean Grip (kg)", font: { color: "#cbd5e1", size: 12 } },
+      tickfont: { color: "#94a3b8" },
+      bgcolor: "rgba(0,0,0,0)",
+      outlinewidth: 0
+    }
+  };
+
+  const peakTrace = {
+    type: "scatter",
+    mode: "lines+markers",
+    name: "Highest-Mean Sleep Tier per Age Band",
+    x: d.peak_x,
+    y: d.peak_y,
+    customdata: d.peak_z,
+    hovertemplate: "<b>%{x}</b> Peak Tier: %{y} (%{customdata} kg)<extra></extra>",
+    line: { color: "#f8fafc", width: 2.5, dash: "dot" },
+    marker: {
+      size: 10,
+      color: "#38bdf8",
+      line: { color: "#ffffff", width: 2 }
+    }
+  };
+
+  const layout = {
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(8,13,26,0.7)",
+    margin: { t: 28, r: 25, b: 60, l: 75 },
+    font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+    xaxis: {
+      title: { text: "Participant Age Band (Years, Ages 16–80+)", font: { size: 13, color: "#e2e8f0" } },
+      gridcolor: "rgba(148,163,184,0.10)"
+    },
+    yaxis: {
+      title: { text: "Usual Nightly Sleep Duration", font: { size: 13, color: "#e2e8f0" } },
+      gridcolor: "rgba(148,163,184,0.10)"
+    },
+    legend: {
+      orientation: "h",
+      x: 0,
+      y: 1.08,
+      font: { color: "#e2e8f0", size: 12 }
+    }
+  };
+
+  Plotly.react("hero-flagship-plot", [heatTrace, peakTrace], layout, {
+    responsive: true,
+    displaylogo: false,
+    modeBarButtonsToRemove: ["lasso2d", "select2d"]
+  });
+}
+
+function renderHeroCloud() {
+  const p = HERO_DATA.points;
+  const q = HERO_DATA.quantiles;
+
+  const catColors = {
+    "Very Short (<=5h)": "#a78bfa",
+    "Short (6h)": "#38bdf8",
+    "Recommended (7-8h)": "#2dd4bf",
+    "Long (9+h)": "#818cf8"
+  };
+
+  const categories = ["Very Short (<=5h)", "Short (6h)", "Recommended (7-8h)", "Long (9+h)"];
+  const traces = [];
+
+  categories.forEach(cat => {
+    const idx = [];
+    for (let i = 0; i < p.cat.length; i++) {
+      if (p.cat[i] === cat) idx.push(i);
+    }
+    traces.push({
+      type: "scattergl",
+      mode: "markers",
+      name: cat,
+      x: idx.map(i => p.x[i]),
+      y: idx.map(i => p.y[i]),
+      customdata: idx.map(i => [p.raw_h[i], p.age[i], p.sex[i]]),
+      hovertemplate:
+        "<b>Combined Grip:</b> %{y} kg<br>" +
+        "<b>Sleep:</b> %{customdata[0]} hrs<br>" +
+        "<b>Age & Sex:</b> %{customdata[1]} yrs (%{customdata[2]})<extra></extra>",
+      marker: {
+        size: 4.5,
+        opacity: 0.34,
+        color: catColors[cat]
+      }
+    });
+  });
+
+  const qHours = q.map(r => r.sleep_hours);
+
+  // 25th to 75th IQR ribbon
+  traces.push({
+    type: "scatter",
+    mode: "lines",
+    x: qHours,
+    y: q.map(r => r.p75),
+    line: { width: 1, color: "rgba(34,211,238,0.5)" },
+    showlegend: false,
+    hoverinfo: "skip"
+  });
+
+  traces.push({
+    type: "scatter",
+    mode: "lines",
+    name: "Interquartile Band (25th–75th %ile)",
+    x: qHours,
+    y: q.map(r => r.p25),
+    fill: "tonexty",
+    fillcolor: "rgba(34,211,238,0.16)",
+    line: { width: 1, color: "rgba(34,211,238,0.5)" },
+    hovertemplate: "Sleep %{x}h — 25th %ile: %{y} kg<extra></extra>"
+  });
+
+  traces.push({
+    type: "scatter",
+    mode: "lines+markers",
+    name: "Median Combined Grip (50th %ile)",
+    x: qHours,
+    y: q.map(r => r.p50),
+    customdata: q.map(r => [r.mean_g, r.n]),
+    hovertemplate:
+      "<b>%{x} Hours of Sleep</b> (n = %{customdata[1]})<br>" +
+      "Median Grip: %{y} kg<br>" +
+      "Mean Grip: %{customdata[0]} kg<extra></extra>",
+    line: { color: "#ffffff", width: 3 },
+    marker: { size: 8, color: "#22d3ee", line: { color: "#ffffff", width: 2 } }
+  });
+
+  const layout = {
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(8,13,26,0.7)",
+    margin: { t: 32, r: 25, b: 60, l: 70 },
+    font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+    xaxis: {
+      title: { text: "Nightly Sleep Duration (Hours, Jittered ±0.3h to Reveal All 10,987 Participants)", font: { size: 13, color: "#e2e8f0" } },
+      tickvals: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+      ticktext: ["2h", "3h", "4h", "5h", "6h", "7h", "8h", "9h", "10h", "11h", "12+h"],
+      gridcolor: "rgba(148,163,184,0.12)"
+    },
+    yaxis: {
+      title: { text: "Combined Bilateral Grip Strength (kg)", font: { size: 13, color: "#e2e8f0" } },
+      gridcolor: "rgba(148,163,184,0.12)"
+    },
+    legend: {
+      orientation: "h",
+      x: 0,
+      y: 1.11,
+      font: { color: "#e2e8f0", size: 11.5 }
+    }
+  };
+
+  Plotly.react("hero-flagship-plot", traces, layout, {
+    responsive: true,
+    displaylogo: false
+  });
+}
+
+function setHeroLens(lens) {
+  currentLens = lens;
+  document.getElementById("lens-surface-btn").classList.toggle("active", lens === "surface");
+  document.getElementById("lens-cloud-btn").classList.toggle("active", lens === "cloud");
+  document.getElementById("sex-toggle-bar").style.display = lens === "surface" ? "flex" : "none";
+
+  const caption = document.getElementById("hero-chart-caption");
+  if (lens === "surface") {
+    caption.textContent = "Smoothed topographic strength surface across seven life-stage bands (ages 16–80+) and seven sleep-duration tiers. Hover any cell for exact sample counts, means, and interquartile ranges, or switch to inspect all 10,987 individual participants.";
+    renderHeroSurface();
+  } else {
+    caption.textContent = "Every one of the 10,987 validated NHANES participants rendered via WebGL alongside the empirical 25th–75th percentile ribbon and median trajectory across nightly sleep hours.";
+    renderHeroCloud();
+  }
+}
+
+function setSurfaceSex(sex) {
+  currentSex = sex;
+  ["All", "Male", "Female"].forEach(s => {
+    document.getElementById("sex-" + s).classList.toggle("active", s === sex);
+  });
+  if (currentLens === "surface") renderHeroSurface();
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+  renderHeroSurface();
+});
+</script>
+```

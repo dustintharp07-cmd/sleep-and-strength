@@ -1,0 +1,19 @@
+project:
+  type: default
+  render:
+    - project.qmd
+
+format:
+  html:
+    theme: darkly
+    css: css/styles.css
+    toc: false
+    page-layout: custom
+    smooth-scroll: true
+    code-copy: false
+    anchor-sections: false
+
+execute:
+  echo: false
+  warning: false
+  message: false

@@ -1,0 +1,656 @@
+---
+title: "Interactive Explorer — Sleep & Strength"
+---
+
+```{r}
+library(tidyverse)
+library(plotly)
+library(jsonlite)
+
+df <- read_rds("data/processed/nhanes_sleep_strength.rds")
+
+# Compact column encoding for fast browser cross-filtering of all 10,987 rows
+explorer_records <- df |>
+  transmute(
+    a = as.integer(age),
+    ag = as.character(age_group),
+    s = as.character(sex),
+    r = as.character(race_ethnicity),
+    sh = as.integer(sleep_hours),
+    sc = as.character(sleep_category),
+    ts = coalesce(as.character(trouble_sleeping), "Unknown"),
+    cg = round(combined_grip_kg, 1),
+    mg = round(max_hand_grip_kg, 1)
+  )
+
+explorer_json <- toJSON(explorer_records, dataframe = "columns", auto_unbox = TRUE)
+
+dep_widget <- plot_ly() |>
+  config(displayModeBar = FALSE) |>
+  htmlwidgets::onRender("function(el) { el.style.display = 'none'; }")
+```
+
+```{r}
+dep_widget
+```
+
+```{=html}
+<div class="platform-shell">
+
+  <!-- HEADER -->
+  <section class="hero-section" style="padding: 2rem 2.25rem;">
+    <div class="eyebrow-badge">
+      Interactive Data Laboratory &middot; Real-Time Cross-Filtering &middot; Ages 16–80+
+    </div>
+    <h1 class="hero-title" style="font-size: clamp(1.75rem, 3.2vw, 2.55rem);">
+      Explore <span class="gradient-text">Sleep, Strength &amp; Lifespan</span> Patterns
+    </h1>
+    <p class="hero-subtitle" style="margin-bottom: 0;">
+      Filter the 10,987 NHANES 2011–2014 participants across age groups (from ages 16–29 through 75–80+), sleep-duration tiers, biological sex, demographic background, and self-reported sleep trouble. Every metric and visualization updates live from the underlying observations.
+    </p>
+  </section>
+
+  <!-- FILTER STUDIO -->
+  <section class="filter-studio">
+    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem;">
+      <div>
+        <span class="section-kicker">Cohort Controls</span>
+        <h3 style="font-size: 1.1rem; font-weight: 700; margin: 0; color: #f8fafc;">Configure Analytical Slice</h3>
+      </div>
+      <div class="control-bar">
+        <button class="pill-btn active" id="metric-cg" onclick="setMetric('cg')">Combined Bilateral Grip (kg)</button>
+        <button class="pill-btn" id="metric-mg" onclick="setMetric('mg')">Max Single-Hand Grip (kg)</button>
+        <button class="pill-btn" onclick="resetAllFilters()" style="border-color: rgba(167,139,250,0.45); color: #ddd6fe;">
+          Reset All Filters
+        </button>
+      </div>
+    </div>
+
+    <div class="filter-grid">
+      <div>
+        <label class="filter-group-label">Age Groups (Ages 16–80+)</label>
+        <div class="chip-group" id="age-chips">
+          <span class="chip-toggle selected" data-val="16-29" onclick="toggleChip(this, 'age')">16–29</span>
+          <span class="chip-toggle selected" data-val="30-44" onclick="toggleChip(this, 'age')">30–44</span>
+          <span class="chip-toggle selected" data-val="45-59" onclick="toggleChip(this, 'age')">45–59</span>
+          <span class="chip-toggle selected" data-val="60-74" onclick="toggleChip(this, 'age')">60–74</span>
+          <span class="chip-toggle selected" data-val="75-80+" onclick="toggleChip(this, 'age')">75–80+</span>
+        </div>
+      </div>
+
+      <div>
+        <label class="filter-group-label">Sleep Duration Categories</label>
+        <div class="chip-group" id="sleep-chips">
+          <span class="chip-toggle selected" data-val="Very Short (<=5h)" onclick="toggleChip(this, 'sleep')">&le;5h Very Short</span>
+          <span class="chip-toggle selected" data-val="Short (6h)" onclick="toggleChip(this, 'sleep')">6h Short</span>
+          <span class="chip-toggle selected" data-val="Recommended (7-8h)" onclick="toggleChip(this, 'sleep')">7–8h Recommended</span>
+          <span class="chip-toggle selected" data-val="Long (9+h)" onclick="toggleChip(this, 'sleep')">9+h Long</span>
+        </div>
+      </div>
+
+      <div>
+        <label class="filter-group-label" for="sex-select">Biological Sex</label>
+        <select id="sex-select" class="dark-select" onchange="updateExplorer()">
+          <option value="ALL">All Participants (Male &amp; Female)</option>
+          <option value="Male">Male Only</option>
+          <option value="Female">Female Only</option>
+        </select>
+      </div>
+
+      <div>
+        <label class="filter-group-label" for="race-select">Race / Hispanic Origin (RIDRETH3)</label>
+        <select id="race-select" class="dark-select" onchange="updateExplorer()">
+          <option value="ALL">All Demographic Groups</option>
+          <option value="Non-Hispanic White">Non-Hispanic White</option>
+          <option value="Non-Hispanic Black">Non-Hispanic Black</option>
+          <option value="Mexican American">Mexican American</option>
+          <option value="Non-Hispanic Asian">Non-Hispanic Asian</option>
+          <option value="Other Hispanic">Other Hispanic</option>
+          <option value="Other / Multi-Racial">Other / Multi-Racial</option>
+        </select>
+      </div>
+
+      <div>
+        <label class="filter-group-label" for="trouble-select">Told Doctor Trouble Sleeping (SLQ050)</label>
+        <select id="trouble-select" class="dark-select" onchange="updateExplorer()">
+          <option value="ALL">All Respondents</option>
+          <option value="No">No Reported Sleep Trouble</option>
+          <option value="Yes">Reported Trouble Sleeping</option>
+        </select>
+      </div>
+    </div>
+  </section>
+
+  <!-- LIVE KPI SUMMARY -->
+  <section class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpi-label">Filtered Observations</div>
+      <div class="kpi-value accent-cyan" id="kpi-n">10,987</div>
+      <div class="kpi-sub" id="kpi-n-pct">100.0% of validated sample</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label" id="kpi-mean-label">Mean Grip Strength</div>
+      <div class="kpi-value accent-teal" id="kpi-mean">70.8 kg</div>
+      <div class="kpi-sub" id="kpi-sd">SD: 22.4 kg</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Median &amp; Interquartile Spread</div>
+      <div class="kpi-value accent-blue" id="kpi-median">67.0 kg</div>
+      <div class="kpi-sub" id="kpi-iqr">IQR (25th–75th): 53.3 – 88.2 kg</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">7–8h vs 9+h Mean Gap</div>
+      <div class="kpi-value accent-violet" id="kpi-gap">+5.2 kg</div>
+      <div class="kpi-sub" id="kpi-gap-sub">Recommended (7–8h) minus Long (9+h)</div>
+    </div>
+  </section>
+
+  <!-- CHART 1: AGE-STRATIFIED SLEEP CURVES -->
+  <section class="glass-card">
+    <div class="section-header">
+      <div>
+        <div class="section-kicker">Age-Stratified Dose–Response &middot; Mean &plusmn; 95% CI</div>
+        <h2 class="section-title">How Sleep Duration Relates to Strength Within Each Age Group</h2>
+        <p class="section-desc">
+          Mean grip strength across nightly sleep tiers (&le;4h through 10+h) separated by life stage. Tip: filter Biological Sex to <strong>Male Only</strong> or <strong>Female Only</strong> above to inspect within-sex trajectories free of sex-ratio differences.
+        </p>
+      </div>
+    </div>
+    <div id="plot-age-trajectories" style="width: 100%; height: 460px;"></div>
+  </section>
+
+  <!-- CHARTS 2 & 3 SIDE BY SIDE -->
+  <div class="info-grid-2">
+    <section class="glass-card" style="margin-bottom: 0;">
+      <div class="section-kicker">Distributional Spread</div>
+      <h2 class="section-title" style="font-size: 1.25rem;">Grip Strength Distribution by Sleep Category</h2>
+      <p class="section-desc" style="font-size: 0.87rem; margin-bottom: 0.75rem;">
+        Box-and-quartile profiles showing medians, means (dashed diamond), and full population spread across sleep tiers.
+      </p>
+      <div id="plot-sleep-boxes" style="width: 100%; height: 420px;"></div>
+    </section>
+
+    <section class="glass-card" style="margin-bottom: 0;">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem; flex-wrap: wrap;">
+        <div>
+          <div class="section-kicker">Lifespan &amp; Demographics</div>
+          <h2 class="section-title" style="font-size: 1.25rem;" id="right-panel-title">Strength Across the Lifespan (Ages 16–80+)</h2>
+        </div>
+        <div class="control-bar">
+          <button class="pill-btn active" id="subview-lifespan" onclick="setRightPanel('lifespan')" style="padding: 0.3rem 0.7rem; font-size: 0.76rem;">Lifespan Curve</button>
+          <button class="pill-btn" id="subview-demo" onclick="setRightPanel('demo')" style="padding: 0.3rem 0.7rem; font-size: 0.76rem;">Demographics</button>
+        </div>
+      </div>
+      <p class="section-desc" style="font-size: 0.87rem; margin-bottom: 0.75rem;" id="right-panel-desc">
+        Continuous 5-year age trajectories from 16 to 80+ comparing sleep-duration categories across adulthood.
+      </p>
+      <div id="plot-right-panel" style="width: 100%; height: 420px;"></div>
+    </section>
+  </div>
+
+</div>
+```
+
+```{r}
+#| results: asis
+cat(paste0("<script>const RAW = ", explorer_json, ";</script>\n"))
+```
+
+```{=html}
+<script>
+const TOTAL_N = RAW.a.length;
+let activeMetric = "cg";
+let rightPanelMode = "lifespan";
+
+const selectedAges = new Set(["16-29", "30-44", "45-59", "60-74", "75-80+"]);
+const selectedSleeps = new Set([
+  "Very Short (<=5h)",
+  "Short (6h)",
+  "Recommended (7-8h)",
+  "Long (9+h)"
+]);
+
+const AGE_PALETTE = {
+  "16-29": "#38bdf8",
+  "30-44": "#2dd4bf",
+  "45-59": "#a78bfa",
+  "60-74": "#818cf8",
+  "75-80+": "#f472b6"
+};
+
+const SLEEP_PALETTE = {
+  "Very Short (<=5h)": "#a78bfa",
+  "Short (6h)": "#38bdf8",
+  "Recommended (7-8h)": "#2dd4bf",
+  "Long (9+h)": "#818cf8"
+};
+
+function mean(arr) {
+  if (!arr.length) return NaN;
+  let s = 0;
+  for (let i = 0; i < arr.length; i++) s += arr[i];
+  return s / arr.length;
+}
+
+function sd(arr, m) {
+  if (arr.length < 2) return 0;
+  let s = 0;
+  for (let i = 0; i < arr.length; i++) {
+    const d = arr[i] - m;
+    s += d * d;
+  }
+  return Math.sqrt(s / (arr.length - 1));
+}
+
+function quantileSorted(sorted, q) {
+  if (!sorted.length) return NaN;
+  const pos = (sorted.length - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  if (sorted[base + 1] !== undefined) {
+    return sorted[base] + rest * (sorted[base + 1] - sorted[base]);
+  }
+  return sorted[base];
+}
+
+function sleepBinLabel(h) {
+  if (h <= 4) return "≤4h";
+  if (h >= 10) return "10+h";
+  return h + "h";
+}
+
+function toggleChip(el, kind) {
+  const val = el.getAttribute("data-val");
+  const targetSet = kind === "age" ? selectedAges : selectedSleeps;
+  if (targetSet.has(val)) {
+    if (targetSet.size === 1) return; // keep at least one active
+    targetSet.delete(val);
+    el.classList.remove("selected");
+  } else {
+    targetSet.add(val);
+    el.classList.add("selected");
+  }
+  updateExplorer();
+}
+
+function setMetric(m) {
+  activeMetric = m;
+  document.getElementById("metric-cg").classList.toggle("active", m === "cg");
+  document.getElementById("metric-mg").classList.toggle("active", m === "mg");
+  updateExplorer();
+}
+
+function setRightPanel(mode) {
+  rightPanelMode = mode;
+  document.getElementById("subview-lifespan").classList.toggle("active", mode === "lifespan");
+  document.getElementById("subview-demo").classList.toggle("active", mode === "demo");
+  document.getElementById("right-panel-title").textContent =
+    mode === "lifespan"
+      ? "Strength Across the Lifespan (Ages 16–80+)"
+      : "Demographic Subgroup Comparison";
+  document.getElementById("right-panel-desc").textContent =
+    mode === "lifespan"
+      ? "Continuous 5-year age trajectories from 16 to 80+ comparing sleep-duration categories across adulthood."
+      : "Mean grip strength (±95% CI) across NHANES race/Hispanic origin groups stratified by biological sex.";
+  updateExplorer();
+}
+
+function resetAllFilters() {
+  ["16-29", "30-44", "45-59", "60-74", "75-80+"].forEach(v => selectedAges.add(v));
+  ["Very Short (<=5h)", "Short (6h)", "Recommended (7-8h)", "Long (9+h)"].forEach(v => selectedSleeps.add(v));
+  document.querySelectorAll(".chip-toggle").forEach(el => el.classList.add("selected"));
+  document.getElementById("sex-select").value = "ALL";
+  document.getElementById("race-select").value = "ALL";
+  document.getElementById("trouble-select").value = "ALL";
+  setMetric("cg");
+}
+
+function getFilteredIndices() {
+  const sexVal = document.getElementById("sex-select").value;
+  const raceVal = document.getElementById("race-select").value;
+  const troubleVal = document.getElementById("trouble-select").value;
+  const idx = [];
+
+  for (let i = 0; i < TOTAL_N; i++) {
+    if (!selectedAges.has(RAW.ag[i])) continue;
+    if (!selectedSleeps.has(RAW.sc[i])) continue;
+    if (sexVal !== "ALL" && RAW.s[i] !== sexVal) continue;
+    if (raceVal !== "ALL" && RAW.r[i] !== raceVal) continue;
+    if (troubleVal !== "ALL" && RAW.ts[i] !== troubleVal) continue;
+    const val = RAW[activeMetric][i];
+    if (val === null || isNaN(val)) continue;
+    idx.push(i);
+  }
+  return idx;
+}
+
+function updateKPIs(idx) {
+  const vals = idx.map(i => RAW[activeMetric][i]);
+  const n = vals.length;
+  const metricName = activeMetric === "cg" ? "Combined Grip" : "Max Hand Grip";
+  document.getElementById("kpi-mean-label").textContent = "Mean " + metricName;
+  document.getElementById("kpi-n").textContent = n.toLocaleString();
+  document.getElementById("kpi-n-pct").textContent =
+    ((n / TOTAL_N) * 100).toFixed(1) + "% of validated sample (10,987)";
+
+  if (n === 0) {
+    document.getElementById("kpi-mean").textContent = "—";
+    document.getElementById("kpi-sd").textContent = "No matching observations";
+    document.getElementById("kpi-median").textContent = "—";
+    document.getElementById("kpi-iqr").textContent = "Adjust filters above";
+    document.getElementById("kpi-gap").textContent = "—";
+    return;
+  }
+
+  const m = mean(vals);
+  const s = sd(vals, m);
+  const sorted = vals.slice().sort((a, b) => a - b);
+  const med = quantileSorted(sorted, 0.5);
+  const q25 = quantileSorted(sorted, 0.25);
+  const q75 = quantileSorted(sorted, 0.75);
+
+  document.getElementById("kpi-mean").textContent = m.toFixed(1) + " kg";
+  document.getElementById("kpi-sd").textContent = "SD: " + s.toFixed(1) + " kg";
+  document.getElementById("kpi-median").textContent = med.toFixed(1) + " kg";
+  document.getElementById("kpi-iqr").textContent =
+    "IQR (25th–75th): " + q25.toFixed(1) + " – " + q75.toFixed(1) + " kg";
+
+  // Recommended vs Long sleep difference
+  const recVals = [];
+  const longVals = [];
+  for (let k = 0; k < idx.length; k++) {
+    const i = idx[k];
+    if (RAW.sc[i] === "Recommended (7-8h)") recVals.push(RAW[activeMetric][i]);
+    else if (RAW.sc[i] === "Long (9+h)") longVals.push(RAW[activeMetric][i]);
+  }
+  if (recVals.length >= 5 && longVals.length >= 5) {
+    const diff = mean(recVals) - mean(longVals);
+    const sign = diff >= 0 ? "+" : "";
+    document.getElementById("kpi-gap").textContent = sign + diff.toFixed(1) + " kg";
+    document.getElementById("kpi-gap-sub").textContent =
+      "7–8h (" + mean(recVals).toFixed(1) + " kg) vs 9+h (" + mean(longVals).toFixed(1) + " kg)";
+  } else {
+    document.getElementById("kpi-gap").textContent = "N/A";
+    document.getElementById("kpi-gap-sub").textContent = "Select both 7–8h and 9+h tiers to compare";
+  }
+}
+
+function renderAgeTrajectories(idx) {
+  const bins = ["≤4h", "5h", "6h", "7h", "8h", "9h", "10+h"];
+  const ageGroups = ["16-29", "30-44", "45-59", "60-74", "75-80+"].filter(g => selectedAges.has(g));
+  const traces = [];
+
+  ageGroups.forEach(ag => {
+    const bucket = {};
+    bins.forEach(b => (bucket[b] = []));
+
+    for (let k = 0; k < idx.length; k++) {
+      const i = idx[k];
+      if (RAW.ag[i] !== ag) continue;
+      const b = sleepBinLabel(RAW.sh[i]);
+      bucket[b].push(RAW[activeMetric][i]);
+    }
+
+    const xs = [];
+    const ys = [];
+    const cis = [];
+    const ns = [];
+
+    bins.forEach(b => {
+      const arr = bucket[b];
+      if (arr.length >= 4) {
+        const m = mean(arr);
+        const ci = 1.96 * (sd(arr, m) / Math.sqrt(arr.length));
+        xs.push(b);
+        ys.push(Number(m.toFixed(1)));
+        cis.push(Number(ci.toFixed(1)));
+        ns.push(arr.length);
+      }
+    });
+
+    traces.push({
+      type: "scatter",
+      mode: "lines+markers",
+      name: "Ages " + ag,
+      x: xs,
+      y: ys,
+      customdata: ns,
+      error_y: {
+        type: "data",
+        array: cis,
+        visible: true,
+        thickness: 1.4,
+        width: 4,
+        color: AGE_PALETTE[ag]
+      },
+      line: { width: 2.8, color: AGE_PALETTE[ag] },
+      marker: { size: 8, color: AGE_PALETTE[ag], line: { color: "#050811", width: 1.5 } },
+      hovertemplate:
+        "<b>Ages " + ag + " &middot; %{x} Sleep</b><br>" +
+        "Mean Strength: %{y} kg (&plusmn;%{error_y.array} kg 95% CI)<br>" +
+        "Participants: n = %{customdata}<extra></extra>"
+    });
+  });
+
+  const yTitle = activeMetric === "cg" ? "Combined Grip Strength (kg)" : "Max Single-Hand Grip (kg)";
+  const layout = {
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(8,13,26,0.7)",
+    margin: { t: 28, r: 24, b: 56, l: 68 },
+    font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+    xaxis: {
+      title: { text: "Usual Nightly Sleep Duration", font: { size: 13, color: "#e2e8f0" } },
+      categoryorder: "array",
+      categoryarray: bins,
+      gridcolor: "rgba(148,163,184,0.10)"
+    },
+    yaxis: {
+      title: { text: yTitle, font: { size: 13, color: "#e2e8f0" } },
+      gridcolor: "rgba(148,163,184,0.10)"
+    },
+    legend: {
+      orientation: "h",
+      x: 0,
+      y: 1.11,
+      font: { color: "#e2e8f0", size: 12 }
+    }
+  };
+
+  Plotly.react("plot-age-trajectories", traces, layout, { responsive: true, displaylogo: false });
+}
+
+function renderSleepBoxes(idx) {
+  const cats = [
+    "Very Short (<=5h)",
+    "Short (6h)",
+    "Recommended (7-8h)",
+    "Long (9+h)"
+  ].filter(c => selectedSleeps.has(c));
+
+  const traces = cats.map(cat => {
+    const vals = [];
+    for (let k = 0; k < idx.length; k++) {
+      const i = idx[k];
+      if (RAW.sc[i] === cat) vals.push(RAW[activeMetric][i]);
+    }
+    return {
+      type: "box",
+      name: cat.replace(" (<=5h)", "\n(≤5h)").replace(" (6h)", "\n(6h)").replace(" (7-8h)", "\n(7–8h)").replace(" (9+h)", "\n(9+h)"),
+      y: vals,
+      boxmean: true,
+      boxpoints: false,
+      marker: { color: SLEEP_PALETTE[cat] },
+      line: { color: SLEEP_PALETTE[cat], width: 2 },
+      fillcolor: "rgba(34, 211, 238, 0.12)"
+    };
+  });
+
+  const yTitle = activeMetric === "cg" ? "Combined Grip Strength (kg)" : "Max Single-Hand Grip (kg)";
+  const layout = {
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(8,13,26,0.7)",
+    margin: { t: 18, r: 18, b: 58, l: 64 },
+    showlegend: false,
+    font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+    xaxis: { gridcolor: "rgba(148,163,184,0.08)" },
+    yaxis: {
+      title: { text: yTitle, font: { size: 12.5, color: "#e2e8f0" } },
+      gridcolor: "rgba(148,163,184,0.10)"
+    }
+  };
+
+  Plotly.react("plot-sleep-boxes", traces, layout, { responsive: true, displaylogo: false });
+}
+
+function renderRightPanel(idx) {
+  const yTitle = activeMetric === "cg" ? "Combined Grip Strength (kg)" : "Max Single-Hand Grip (kg)";
+
+  if (rightPanelMode === "lifespan") {
+    const ageBins = [
+      { label: "16–22", min: 16, max: 22 },
+      { label: "23–29", min: 23, max: 29 },
+      { label: "30–37", min: 30, max: 37 },
+      { label: "38–45", min: 38, max: 45 },
+      { label: "46–53", min: 46, max: 53 },
+      { label: "54–61", min: 54, max: 61 },
+      { label: "62–69", min: 62, max: 69 },
+      { label: "70–76", min: 70, max: 76 },
+      { label: "77–80+", min: 77, max: 85 }
+    ];
+
+    const cats = [
+      "Very Short (<=5h)",
+      "Short (6h)",
+      "Recommended (7-8h)",
+      "Long (9+h)"
+    ].filter(c => selectedSleeps.has(c));
+
+    const traces = cats.map(cat => {
+      const xs = [];
+      const ys = [];
+      const ns = [];
+
+      ageBins.forEach(ab => {
+        const arr = [];
+        for (let k = 0; k < idx.length; k++) {
+          const i = idx[k];
+          if (RAW.sc[i] === cat && RAW.a[i] >= ab.min && RAW.a[i] <= ab.max) {
+            arr.push(RAW[activeMetric][i]);
+          }
+        }
+        if (arr.length >= 5) {
+          xs.push(ab.label);
+          ys.push(Number(mean(arr).toFixed(1)));
+          ns.push(arr.length);
+        }
+      });
+
+      return {
+        type: "scatter",
+        mode: "lines+markers",
+        name: cat,
+        x: xs,
+        y: ys,
+        customdata: ns,
+        line: { width: 2.6, shape: "spline", color: SLEEP_PALETTE[cat] },
+        marker: { size: 7, color: SLEEP_PALETTE[cat] },
+        hovertemplate:
+          "<b>" + cat + "</b> (Ages %{x})<br>" +
+          "Mean: %{y} kg (n = %{customdata})<extra></extra>"
+      };
+    });
+
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.7)",
+      margin: { t: 28, r: 18, b: 58, l: 64 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: {
+        title: { text: "Participant Age (Years, 16 to 80+)", font: { size: 12, color: "#e2e8f0" } },
+        gridcolor: "rgba(148,163,184,0.10)"
+      },
+      yaxis: {
+        title: { text: yTitle, font: { size: 12.5, color: "#e2e8f0" } },
+        gridcolor: "rgba(148,163,184,0.10)"
+      },
+      legend: { orientation: "h", x: 0, y: 1.15, font: { size: 10.5, color: "#e2e8f0" } }
+    };
+
+    Plotly.react("plot-right-panel", traces, layout, { responsive: true, displaylogo: false });
+  } else {
+    const groups = [
+      "Non-Hispanic Black",
+      "Non-Hispanic White",
+      "Mexican American",
+      "Other / Multi-Racial",
+      "Other Hispanic",
+      "Non-Hispanic Asian"
+    ];
+    const sexes = ["Male", "Female"];
+    const sexColors = { Male: "#38bdf8", Female: "#2dd4bf" };
+
+    const traces = sexes.map(sx => {
+      const xs = [];
+      const ys = [];
+      const cis = [];
+      const ns = [];
+
+      groups.forEach(g => {
+        const arr = [];
+        for (let k = 0; k < idx.length; k++) {
+          const i = idx[k];
+          if (RAW.s[i] === sx && RAW.r[i] === g) arr.push(RAW[activeMetric][i]);
+        }
+        if (arr.length >= 4) {
+          const m = mean(arr);
+          const ci = 1.96 * (sd(arr, m) / Math.sqrt(arr.length));
+          xs.push(g.replace("Non-Hispanic ", "NH "));
+          ys.push(Number(m.toFixed(1)));
+          cis.push(Number(ci.toFixed(1)));
+          ns.push(arr.length);
+        }
+      });
+
+      return {
+        type: "bar",
+        name: sx,
+        x: xs,
+        y: ys,
+        customdata: ns,
+        marker: { color: sexColors[sx], opacity: 0.88 },
+        error_y: { type: "data", array: cis, visible: true, color: "#e2e8f0", thickness: 1.2 },
+        hovertemplate: "<b>%{x} (" + sx + ")</b><br>Mean: %{y} kg (n = %{customdata})<extra></extra>"
+      };
+    });
+
+    const layout = {
+      barmode: "group",
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.7)",
+      margin: { t: 28, r: 18, b: 78, l: 64 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: { tickangle: -22, gridcolor: "rgba(148,163,184,0.08)" },
+      yaxis: {
+        title: { text: yTitle, font: { size: 12.5, color: "#e2e8f0" } },
+        gridcolor: "rgba(148,163,184,0.10)"
+      },
+      legend: { orientation: "h", x: 0, y: 1.13, font: { size: 11.5, color: "#e2e8f0" } }
+    };
+
+    Plotly.react("plot-right-panel", traces, layout, { responsive: true, displaylogo: false });
+  }
+}
+
+function updateExplorer() {
+  const idx = getFilteredIndices();
+  updateKPIs(idx);
+  renderAgeTrajectories(idx);
+  renderSleepBoxes(idx);
+  renderRightPanel(idx);
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+  updateExplorer();
+});
+</script>
+```

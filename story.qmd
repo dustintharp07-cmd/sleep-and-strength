@@ -1,0 +1,80 @@
+---
+title: "The Story — Reserved"
+---
+
+```{=html}
+<div class="platform-shell">
+
+  <section class="hero-section" style="padding: 2.15rem 2.25rem;">
+    <div class="eyebrow-badge" style="color: #a78bfa; border-color: rgba(167,139,250,0.35); background: rgba(167,139,250,0.10);">
+      Section Reserved &middot; Stage II Narrative Pending Approval
+    </div>
+    <h1 class="hero-title" style="font-size: clamp(1.85rem, 3.4vw, 2.7rem);">
+      <span class="gradient-text">The Story</span> &mdash; Architecture Reserved
+    </h1>
+    <p class="hero-subtitle" style="margin-bottom: 0;">
+      This page reserves the structural layout and navigation slot for the project's narrative section. Substantive wording is intentionally left unwritten pending review of empirical findings and final narrative approval.
+    </p>
+  </section>
+
+  <div class="reserved-banner">
+    <strong style="color: #ddd6fe; font-size: 0.92rem; letter-spacing: 0.03em;">
+      STATUS: PLACEHOLDER ONLY
+    </strong>
+    <p style="margin: 0.35rem 0 0 0; font-size: 0.9rem; color: #cbd5e1;">
+      No final interpretive narrative or prose conclusions have been drafted here yet. Use the <a href="explore.html" style="color: #22d3ee;">Interactive Explorer</a> to inspect empirical patterns across the 10,987 participants (ages 16–80+) before finalizing this section's copy.
+    </p>
+  </div>
+
+  <section class="glass-card">
+    <div class="section-kicker">Planned Narrative Structure</div>
+    <h2 class="section-title" style="margin-bottom: 1.25rem;">Reserved Content Slots</h2>
+
+    <div class="placeholder-stage">
+      <span class="code-tag">Slot 01 &middot; Origin</span>
+      <h4 style="color: #f8fafc; margin: 0 0 0.3rem 0;">Athletic Performance &amp; Recovery Starting Point</h4>
+      <p style="color: #64748b; font-size: 0.9rem; margin: 0;">
+        [Reserved — Final narrative text to be inserted after review.]
+      </p>
+    </div>
+
+    <div class="placeholder-stage">
+      <span class="code-tag">Slot 02 &middot; Scope Expansion</span>
+      <h4 style="color: #f8fafc; margin: 0 0 0.3rem 0;">Beyond Athletics: Sleep &amp; Physical Functioning Across Ages 16–80+</h4>
+      <p style="color: #64748b; font-size: 0.9rem; margin: 0;">
+        [Reserved — Final narrative text to be inserted after review.]
+      </p>
+    </div>
+
+    <div class="placeholder-stage" style="margin-bottom: 0;">
+      <span class="code-tag">Slot 03 &middot; Empirical Takeaways &amp; Observational Scope</span>
+      <h4 style="color: #f8fafc; margin: 0 0 0.3rem 0;">What the NHANES 2011–2014 Data Show (and Do Not Show)</h4>
+      <p style="color: #64748b; font-size: 0.9rem; margin: 0;">
+        [Reserved — Final narrative text to be inserted after review.]
+      </p>
+    </div>
+  </section>
+
+  <section class="info-grid-2">
+    <a class="nav-portal-card" href="index.html">
+      <div class="section-kicker">Return</div>
+      <h3 style="font-size: 1.2rem; font-weight: 700; color: #f8fafc; margin: 0.2rem 0 0.35rem 0;">
+        &larr; Back to Overview &amp; Flagship Landscape
+      </h3>
+      <p style="font-size: 0.88rem; color: #94a3b8; margin: 0;">
+        Review the Lifespan &times; Sleep topographic surface and sample methodology.
+      </p>
+    </a>
+
+    <a class="nav-portal-card" href="explore.html">
+      <div class="section-kicker">Explore</div>
+      <h3 style="font-size: 1.2rem; font-weight: 700; color: #f8fafc; margin: 0.2rem 0 0.35rem 0;">
+        Open Interactive Data Explorer &rarr;
+      </h3>
+      <p style="font-size: 0.88rem; color: #94a3b8; margin: 0;">
+        Examine age-stratified curves, quantile distributions, and demographic slices.
+      </p>
+    </a>
+  </section>
+
+</div>

@@ -1,0 +1,8 @@
+step,n
+Total NHANES 2011-2014 participants (DEMO_G + DEMO_H),19931
+"Participants in Sleep Questionnaire (SLQ_G + SLQ_H, ages 16+)",12639
+"Participants in Muscle Strength Exam (MGX_G + MGX_H, ages 6+)",16112
+Inner-joined across DEMO + SLQ + MGX (ages 16+ examined in MEC),12185
+"Excluded: missing or refused/don't-know sleep hours (NA, 77, 99)",24
+Excluded: missing combined grip strength (incomplete bilateral test),1174
+Final clean analytical dataset,10987

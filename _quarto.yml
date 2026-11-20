@@ -1,7 +1,37 @@
 project:
-  type: default
+  type: website
+  output-dir: _site
   render:
-    - project.qmd
+    - index.qmd
+    - recovery.qmd
+    - lifespan.qmd
+    - aging-sleep.qmd
+    - explore.qmd
+    - about.qmd
+
+website:
+  title: "Sleep & Physical Strength"
+  favicon: images/favicon.svg
+  navbar:
+    logo: images/favicon.svg
+    pinned: true
+    left:
+      - text: "Home"
+        href: index.qmd
+      - text: "Athletic Recovery"
+        href: recovery.qmd
+      - text: "Sex & Lifespan"
+        href: lifespan.qmd
+      - text: "Aging & Sleep Quality"
+        href: aging-sleep.qmd
+      - text: "Interactive Explorer"
+        href: explore.qmd
+    right:
+      - text: "About"
+        href: about.qmd
+  page-footer:
+    left: "Sleep & Physical Strength &middot; CDC NHANES 2011–2014 (N = 10,987)"
+    right: "Observational Cross-Sectional Analysis &middot; Built with R &amp; Quarto"
 
 format:
   html:

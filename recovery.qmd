@@ -1,0 +1,613 @@
+---
+title: "Athletic Recovery — Sleep & Physical Strength"
+---
+
+```{r}
+library(tidyverse)
+library(haven)
+library(survey)
+library(splines)
+library(broom)
+library(plotly)
+library(jsonlite)
+library(scales)
+
+fmt1 <- \(x) sprintf("%.1f", x)
+fmt2 <- \(x) sprintf("%.2f", x)
+fmt_signed <- \(x, digits = 2) sprintf(paste0("%+.", digits, "f"), x)
+
+# 1. Load preserved 10,987-row dataset (unmodified) + construct verified NHANES MEC design
+df <- read_rds("data/processed/nhanes_sleep_strength.rds") |>
+  mutate(
+    sleep_cat_ref = relevel(sleep_category, ref = "Recommended (7-8h)"),
+    sleep_bin_7 = case_when(
+      sleep_hours <= 4 ~ "≤4h",
+      sleep_hours == 5 ~ "5h",
+      sleep_hours == 6 ~ "6h",
+      sleep_hours == 7 ~ "7h",
+      sleep_hours == 8 ~ "8h",
+      sleep_hours == 9 ~ "9h",
+      sleep_hours >= 10 ~ "10+h"
+    ) |> factor(levels = c("≤4h", "5h", "6h", "7h", "8h", "9h", "10+h"))
+  )
+
+demo_mec <- bind_rows(
+  read_xpt("data/raw/DEMO_G.XPT") |> select(SEQN, SDMVPSU, SDMVSTRA, WTMEC2YR),
+  read_xpt("data/raw/DEMO_H.XPT") |> select(SEQN, SDMVPSU, SDMVSTRA, WTMEC2YR)
+) |>
+  filter(WTMEC2YR > 0) |>
+  mutate(mec_weight_4yr = WTMEC2YR / 2) |>
+  left_join(df |> select(-mec_weight_4yr) |> mutate(in_cohort = TRUE), by = "SEQN") |>
+  mutate(in_cohort = coalesce(in_cohort, FALSE))
+
+des_mec_full <- svydesign(
+  id = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~mec_weight_4yr,
+  nest = TRUE, data = demo_mec
+)
+des_analytic <- subset(des_mec_full, in_cohort)
+des_young <- subset(des_analytic, age >= 16 & age <= 44)
+
+# 2. Young & Prime-Age Adult Cohort (Ages 16-44, n = 5,551) metrics
+df_young <- df |> filter(age >= 16, age <= 44)
+n_total <- nrow(df)
+n_young <- nrow(df_young)
+n_young_m <- sum(df_young$sex == "Male")
+n_young_f <- sum(df_young$sex == "Female")
+pct_young <- round(n_young / n_total * 100, 1)
+
+# Survey-weighted regression in ages 16-44
+m_svy_young <- svyglm(combined_grip_kg ~ sleep_cat_ref + sex * ns(age, df = 4), design = des_young)
+td_young <- tidy(m_svy_young, conf.int = TRUE) |>
+  filter(str_starts(term, "sleep_cat_ref")) |>
+  mutate(cat = str_remove(term, "^sleep_cat_ref"))
+
+y_6h <- td_young |> filter(cat == "Short (6h)")
+y_5h <- td_young |> filter(cat == "Very Short (<=5h)")
+y_9h <- td_young |> filter(cat == "Long (9+h)")
+
+# 3. Hour-by-hour profiles in Ages 16-29 & 30-44 by Sex (Unweighted & Survey-Weighted, Combined & Max Single-Hand)
+build_young_hourly <- \(metric_col) {
+  fml <- as.formula(paste0("~", metric_col))
+  svy_res <- svyby(
+    fml, ~age_group + sex + sleep_bin_7,
+    design = des_young, FUN = svymean, vartype = c("se", "ci")
+  ) |>
+    as_tibble() |>
+    rename(w_mean = all_of(metric_col), w_lo = ci_l, w_hi = ci_u)
+
+  unw_res <- df_young |>
+    group_by(age_group, sex, sleep_bin_7) |>
+    summarise(
+      n = n(),
+      u_mean = mean(.data[[metric_col]]),
+      u_se = sd(.data[[metric_col]]) / sqrt(n()),
+      u_lo = u_mean - qt(0.975, pmax(n() - 1L, 1L)) * u_se,
+      u_hi = u_mean + qt(0.975, pmax(n() - 1L, 1L)) * u_se,
+      .groups = "drop"
+    )
+
+  unw_res |>
+    left_join(svy_res, by = c("age_group", "sex", "sleep_bin_7")) |>
+    mutate(
+      age_group = as.character(age_group),
+      sex = as.character(sex),
+      sleep_bin = as.character(sleep_bin_7),
+      bin_idx = match(as.character(sleep_bin_7), levels(df$sleep_bin_7)) - 1L,
+      across(c(u_mean, u_lo, u_hi, w_mean, w_lo, w_hi), \(v) round(v, 1))
+    ) |>
+    select(age_group, sex, sleep_bin, bin_idx, n, u_mean, u_lo, u_hi, w_mean, w_lo, w_hi)
+}
+
+young_hourly <- list(
+  cg = build_young_hourly("combined_grip_kg"),
+  mg = build_young_hourly("max_hand_grip_kg")
+)
+
+# 4. Four-Model Stepwise Attenuation across full N = 10,987 (vs Recommended 7-8h)
+m1_unadj <- lm(combined_grip_kg ~ sleep_cat_ref, data = df)
+m2_sex <- lm(combined_grip_kg ~ sleep_cat_ref + sex, data = df)
+m3_agesex <- lm(combined_grip_kg ~ sleep_cat_ref + sex * ns(age, df = 5), data = df)
+m4_svy <- svyglm(combined_grip_kg ~ sleep_cat_ref + sex * ns(age, df = 5), design = des_analytic)
+
+extract_sleep_coefs <- \(mod, mod_label, mod_type) {
+  tidy(mod, conf.int = TRUE) |>
+    filter(str_starts(term, "sleep_cat_ref")) |>
+    transmute(
+      model = mod_label,
+      type = mod_type,
+      category = str_remove(term, "^sleep_cat_ref"),
+      est = round(estimate, 2),
+      se = round(std.error, 2),
+      lo = round(conf.low, 2),
+      hi = round(conf.high, 2),
+      pval = p.value
+    )
+}
+
+model_comp <- bind_rows(
+  extract_sleep_coefs(m1_unadj, "1. Unadjusted Sample OLS", "Descriptive"),
+  extract_sleep_coefs(m2_sex, "2. Sex-Adjusted OLS", "Adjusted"),
+  extract_sleep_coefs(m3_agesex, "3. Sex × Age-Spline OLS", "Adjusted"),
+  extract_sleep_coefs(m4_svy, "4. NHANES Survey-Weighted GLM", "Survey-Weighted")
+)
+
+raw_5h_est <- model_comp |> filter(str_starts(model, "1."), category == "Very Short (<=5h)") |> pull(est)
+raw_6h_est <- model_comp |> filter(str_starts(model, "1."), category == "Short (6h)") |> pull(est)
+raw_9h_est <- model_comp |> filter(str_starts(model, "1."), category == "Long (9+h)") |> pull(est)
+adj_9h_est <- model_comp |> filter(str_starts(model, "3."), category == "Long (9+h)") |> pull(est)
+svy_9h_row <- model_comp |> filter(str_starts(model, "4."), category == "Long (9+h)")
+svy_6h_row <- model_comp |> filter(str_starts(model, "4."), category == "Short (6h)")
+svy_5h_row <- model_comp |> filter(str_starts(model, "4."), category == "Very Short (<=5h)")
+attenuation_pct <- round((1 - abs(adj_9h_est / raw_9h_est)) * 100, 0)
+
+rec_payload <- toJSON(
+  list(
+    meta = list(n_young_m = n_young_m, n_young_f = n_young_f),
+    hourly = young_hourly,
+    models = model_comp
+  ),
+  dataframe = "columns",
+  auto_unbox = TRUE
+)
+
+dep_widget <- plot_ly() |>
+  config(displayModeBar = FALSE) |>
+  htmlwidgets::onRender("function(el) { el.style.display = 'none'; }")
+```
+
+```{r}
+dep_widget
+```
+
+<div class="platform-shell">
+
+<!-- CHAPTER HEADER -->
+<section class="hero-section" style="padding: 2.15rem 2.3rem;">
+<div class="eyebrow-badge">
+Chapter 1 &middot; Motivating Hypothesis &middot; Athletic Performance &amp; Recovery
+</div>
+<h1 class="hero-title" style="font-size: clamp(1.85rem, 3.4vw, 2.75rem);">
+Does Habitual Short Sleep Erode <span class="gradient-text">Maximal Grip Strength</span>?
+</h1>
+<p class="hero-subtitle" style="margin-bottom: 1.1rem;">
+Prior experimental reviews show that acute sleep loss (`&le;6h` in 24 hours) measurably reduces next-day exercise performance, particularly across prolonged, skill-intensive, and multi-set resistance sessions (<a href="about.html#references" style="color: #38bdf8; text-decoration: none;">Craven et al., 2022</a>; <a href="about.html#references" style="color: #38bdf8; text-decoration: none;">Knowles et al., 2018</a>). Motivated by that literature, we tested whether habitual short weekday sleep (`&le;5h` or `6h`) aligns with weaker isometric grip force in <strong>`r comma(n_young)` younger NHANES examinees (adolescents and prime-age adults, ages 16–44)</strong> and across all <strong>`r comma(n_total)` participants (ages 16–80+)</strong>.
+</p>
+
+<div class="rq-callout">
+<div class="rq-label">Chapter 1 Analytical Takeaway</div>
+<p class="rq-question">
+Habitual short sleep (`&le;5h` and `6h`) shows no cross-sectional strength deficit relative to `7–8h` (`r fmt_signed(svy_6h_row$est)` kg for `6h`, `p = `r fmt2(svy_6h_row$pval)`` in survey-weighted models), while the observed raw `9+h` strength difference is attenuated by approximately `r attenuation_pct`% after accounting for sex and nonlinear age differences.
+</p>
+</div>
+</section>
+
+<!-- CHAPTER KPI STRIP -->
+<section class="kpi-grid">
+<div class="kpi-card">
+<div class="kpi-label">Ages 16–44 Examinee Slice</div>
+<div class="kpi-value accent-cyan">`r comma(n_young)`</div>
+<div class="kpi-sub">Ages 16–44 (`r pct_young`% of N = `r comma(n_total)`: `r comma(n_young_m)`M &middot; `r comma(n_young_f)`F)</div>
+</div>
+<div class="kpi-card">
+<div class="kpi-label">6h vs. 7–8h (Ages 16–44)</div>
+<div class="kpi-value accent-teal">`r fmt_signed(y_6h$estimate)` kg</div>
+<div class="kpi-sub">Survey-weighted adjusted diff (95% CI [`r fmt_signed(y_6h$conf.low)`, `r fmt_signed(y_6h$conf.high)`])</div>
+</div>
+<div class="kpi-card">
+<div class="kpi-label">&le;5h vs. 7–8h (Ages 16–80+ Survey)</div>
+<div class="kpi-value accent-blue">`r fmt_signed(svy_5h_row$est)` kg</div>
+<div class="kpi-sub">Survey-weighted GLM across all participants (`p = `r fmt2(svy_5h_row$pval)``)</div>
+</div>
+<div class="kpi-card">
+<div class="kpi-label">Attenuation of Raw 9+h Gap</div>
+<div class="kpi-value accent-violet">~`r attenuation_pct`%</div>
+<div class="kpi-sub">Observed `r fmt_signed(raw_9h_est)` kg shifts to `r fmt_signed(adj_9h_est)` kg after sex &amp; age</div>
+</div>
+</section>
+
+<!-- SECTION 1: ADOLESCENTS & PRIME-AGE ADULTS (AGES 16-44) -->
+<section class="glass-card">
+<div class="method-badge-row">
+<span class="method-badge badge-weighted" id="rec-hourly-badge">
+NHANES Survey-Weighted Population Means (95% CI)
+</span>
+<span class="method-badge badge-sample">
+Subgroup Slice: Ages 16–44 &middot; n = `r comma(n_young)` of `r comma(n_total)` (`r comma(n_total - n_young)` Ages 45+ Excluded)
+</span>
+</div>
+
+<div class="section-header" style="margin-bottom: 0.85rem;">
+<div style="max-width: 880px;">
+<h2 class="section-title">
+Among Adolescents and Prime-Age Adults (Ages 16–44), Maximal Isometric Strength Is Flat Across 5 to 8 Hours of Nightly Sleep
+</h2>
+<p class="section-desc">
+Discrete sleep-duration means (&plusmn;95% CI) separated by biological sex and life stage (`16–29` vs. `30–44`). Switch between combined bilateral force (`MGDCGSZ`) and peak single-hand force (`MGXH*`), or compare survey-weighted population estimates against unweighted sample means. Bins with `n < 15` are visually flagged with open markers and wide confidence intervals.
+</p>
+</div>
+</div>
+
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.8rem; padding: 0.8rem 1rem; background: rgba(8, 13, 26, 0.72); border: 1px solid rgba(56, 189, 248, 0.16); border-radius: 14px; margin-bottom: 1rem;">
+<div class="control-bar">
+<span style="font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.08em; color: #cbd5e1; font-weight: 700;">Strength Outcome:</span>
+<button class="pill-btn active" id="rec-metric-cg" onclick="setRecMetric('cg')">Combined Bilateral Grip (kg)</button>
+<button class="pill-btn" id="rec-metric-mg" onclick="setRecMetric('mg')">Peak Single-Hand Grip (kg)</button>
+</div>
+<div class="control-bar">
+<span style="font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.08em; color: #cbd5e1; font-weight: 700;">Estimation Mode:</span>
+<button class="pill-btn active" id="rec-est-w" onclick="setRecEst('w')">Survey-Weighted Mean (95% CI)</button>
+<button class="pill-btn" id="rec-est-u" onclick="setRecEst('u')">Unweighted Sample Mean (95% CI)</button>
+</div>
+</div>
+
+<div id="plot-young-hourly" style="width: 100%; height: 490px;"></div>
+
+<div class="finding-note">
+<strong>Distinguishing background exercise literature from this NHANES result:</strong> Systematic reviews of experimental sleep restriction find more consistent decrements in sustained, skill-demanding, or high-volume multi-joint resistance sessions than in brief, isolated maximal isometric tests (<a href="about.html#references" style="color: #38bdf8; text-decoration: none;">Knowles et al., 2018</a>; <a href="about.html#references" style="color: #38bdf8; text-decoration: none;">Craven et al., 2022</a>). Moreover, whereas laboratory trials induce acute sleep loss, NHANES captures <em>habitual self-reported weekday sleep</em> during a brief, 3-trial per hand isometric Takei dynamometer test (<a href="about.html#references" style="color: #38bdf8; text-decoration: none;">CDC/NCHS MGX Manual, 2013</a>). In our NHANES `16–44` analysis, `6h` sleepers match `7–8h` peers (`r fmt_signed(y_6h$estimate)` kg, `p = `r fmt2(y_6h$p.value)``). Notice also that men aged `30–44` exceed ages `16–29` across sleep tiers because adolescent males (`16–21`) are still gaining muscle mass.
+</div>
+</section>
+
+<!-- SECTION 2: FOUR-MODEL CONFOUNDING ATTENUATION ACROSS ALL 10,987 PARTICIPANTS -->
+<section class="glass-card">
+<div class="method-badge-row">
+<span class="method-badge badge-descriptive">Model 1: Descriptive</span>
+<span class="method-badge badge-adjusted">Models 2–3: Covariate-Adjusted</span>
+<span class="method-badge badge-weighted">Model 4: NHANES Survey-Weighted (df = 32)</span>
+<span class="method-badge badge-sample">Full Analytical Cohort: N = `r comma(n_total)` (0 Missing)</span>
+</div>
+
+<div class="section-header" style="margin-bottom: 0.85rem;">
+<div style="max-width: 900px;">
+<h2 class="section-title">
+Accounting for Biological Sex, Nonlinear Age, and NHANES Survey Design Attenuates the Observed 9+h Difference by ~`r attenuation_pct`% and Leaves Short-Sleep Differences Near Zero
+</h2>
+<p class="section-desc">
+Estimated differences in combined bilateral grip strength (`kg`, &plusmn;95% CI) relative to the <strong>Recommended (7–8h)</strong> reference group across four progressively rigorous specifications.
+</p>
+</div>
+</div>
+
+<div id="plot-model-attenuation" style="width: 100%; height: 430px;"></div>
+
+<div style="margin-top: 1.25rem; overflow-x: auto;">
+<table class="dark-table">
+<thead>
+<tr>
+<th>Model Specification (Reference = Recommended 7–8h)</th>
+<th>Estimation Type</th>
+<th style="text-align: right;">Very Short (&le;5h) [95% CI]</th>
+<th style="text-align: right;">Short (6h) [95% CI]</th>
+<th style="text-align: right;">Long (9+h) [95% CI]</th>
+</tr>
+</thead>
+<tbody>
+```{r}
+#| results: asis
+wide_tab <- model_comp |>
+  mutate(cell = paste0(fmt_signed(est), " kg [", fmt_signed(lo), ", ", fmt_signed(hi), "]")) |>
+  select(model, type, category, cell) |>
+  pivot_wider(names_from = category, values_from = cell)
+
+for (i in seq_len(nrow(wide_tab))) {
+  r <- wide_tab[i, ]
+  cat(paste0(
+    "<tr>",
+    "<td><strong>", r$model, "</strong></td>",
+    "<td>", r$type, "</td>",
+    "<td style='text-align:right;font-variant-numeric:tabular-nums;'>", r[["Very Short (<=5h)"]], "</td>",
+    "<td style='text-align:right;font-variant-numeric:tabular-nums;'>", r[["Short (6h)"]], "</td>",
+    "<td style='text-align:right;font-variant-numeric:tabular-nums;'>", r[["Long (9+h)"]], "</td>",
+    "</tr>\n"
+  ))
+}
+```
+</tbody>
+</table>
+</div>
+
+<div class="finding-note">
+<strong>Interpreting statistical attenuation across the four models:</strong> In unadjusted sample data (Model 1), `&le;5h` and `6h` sleepers average `r fmt_signed(raw_5h_est)` kg and `r fmt_signed(raw_6h_est)` kg relative to `7–8h` sleepers, while `9+h` sleepers average `r fmt_signed(raw_9h_est)` kg. Model 2 (`+ sex`) accounts for sex differences in average strength, and Model 3 (`+ sex * ns(age, df = 5)`) accounts for nonlinear age differences across `16–80+`, attenuating the observed `9+h` difference by approximately `r attenuation_pct`% to `r fmt_signed(adj_9h_est)` kg. Finally, Model 4 incorporates NHANES 4-year MEC weights (`WTMEC2YR / 2`), strata (`SDMVSTRA`), and primary sampling units (`SDMVPSU`), yielding null population mean differences for short sleep (`&le;5h`: `r fmt_signed(svy_5h_row$est)` kg, `p = `r fmt2(svy_5h_row$pval)``; `6h`: `r fmt_signed(svy_6h_row$est)` kg, `p = `r fmt2(svy_6h_row$pval)``) and a modest `r fmt_signed(svy_9h_row$est)` kg (`p = `r sprintf("%.4f", svy_9h_row$pval)``) association for `9+h`. Note that covariate attenuation in cross-sectional models summarizes statistical adjustment and does not establish a causal mechanism.
+</div>
+</section>
+
+<!-- NEXT CHAPTER PORTALS -->
+<section class="info-grid-2">
+<a class="nav-portal-card" href="index.html">
+<div class="section-kicker">Previous</div>
+<h3 style="font-size: 1.18rem; font-weight: 700; color: #f8fafc; margin: 0.2rem 0 0.35rem 0;">
+&larr; Home: All 10,987 Individual Observations
+</h3>
+<p style="font-size: 0.89rem; color: #cbd5e1; margin: 0;">
+Return to the sex-separated participant point clouds and discrete median overlays.
+</p>
+</a>
+
+<a class="nav-portal-card" href="lifespan.html">
+<div class="section-kicker">Next Chapter</div>
+<h3 style="font-size: 1.18rem; font-weight: 700; color: #f8fafc; margin: 0.2rem 0 0.35rem 0;">
+Chapter 2: Biological Sex &amp; the Lifespan Arc &rarr;
+</h3>
+<p style="font-size: 0.89rem; color: #cbd5e1; margin: 0;">
+See how sex (`~31 kg`) and nonlinear aging across `16–80+` shape physical strength and explain NHANES demographic patterns.
+</p>
+</a>
+</section>
+
+</div>
+
+```{r}
+#| results: asis
+cat(paste0("<script>const REC_DATA = ", rec_payload, ";</script>\n"))
+```
+
+```{=html}
+<script>
+(function () {
+  let recMetric = "cg";
+  let recEst = "w";
+
+  const BINS = ["≤4h", "5h", "6h", "7h", "8h", "9h", "10+h"];
+
+  function buildYoungSide(sexName, axisSuffix) {
+    const tbl = REC_DATA.hourly[recMetric];
+    const stages = [
+      { ag: "16-29", label: "Ages 16–29", color: sexName === "Male" ? "#38bdf8" : "#f472b6", offset: -0.11 },
+      { ag: "30-44", label: "Ages 30–44", color: sexName === "Male" ? "#2dd4bf" : "#c084fc", offset: 0.11 }
+    ];
+
+    return stages.map(st => {
+      const xs = [];
+      const ys = [];
+      const errHi = [];
+      const errLo = [];
+      const cdata = [];
+      const symbols = [];
+
+      for (let i = 0; i < tbl.sex.length; i++) {
+        if (tbl.sex[i] !== sexName || tbl.age_group[i] !== st.ag) continue;
+        const m = recEst === "w" ? tbl.w_mean[i] : tbl.u_mean[i];
+        const lo = recEst === "w" ? tbl.w_lo[i] : tbl.u_lo[i];
+        const hi = recEst === "w" ? tbl.w_hi[i] : tbl.u_hi[i];
+        const n = tbl.n[i];
+        xs.push(tbl.bin_idx[i] + st.offset);
+        ys.push(m);
+        errHi.push(Number((hi - m).toFixed(2)));
+        errLo.push(Number((m - lo).toFixed(2)));
+        cdata.push([tbl.sleep_bin[i], n, lo.toFixed(1), hi.toFixed(1)]);
+        symbols.push(n < 15 ? "circle-open" : "circle");
+      }
+
+      return {
+        type: "scatter",
+        mode: "markers",
+        name: sexName + " · " + st.label,
+        xaxis: "x" + axisSuffix,
+        yaxis: "y" + axisSuffix,
+        x: xs,
+        y: ys,
+        customdata: cdata,
+        marker: {
+          size: 9.5,
+          symbol: symbols,
+          color: st.color,
+          line: { color: "#f8fafc", width: 1.5 }
+        },
+        error_y: {
+          type: "data",
+          symmetric: false,
+          array: errHi,
+          arrayminus: errLo,
+          visible: true,
+          color: st.color,
+          thickness: 2,
+          width: 5
+        },
+        hovertemplate:
+          "<b>" + sexName + " (" + st.label + ") &middot; %{customdata[0]} Sleep</b><br>" +
+          "Mean Grip: <b>%{y:.1f} kg</b> [95% CI: %{customdata[2]}–%{customdata[3]} kg]<br>" +
+          "Subgroup Sample: n = %{customdata[1]}<extra></extra>"
+      };
+    });
+  }
+
+  function renderYoungHourly() {
+    const mTraces = buildYoungSide("Male", "");
+    const fTraces = buildYoungSide("Female", "2");
+    const yTitle = recMetric === "cg" ? "Combined Bilateral Grip (kg)" : "Peak Single-Hand Grip (kg)";
+    const yRange = recMetric === "cg" ? [35, 118] : [18, 62];
+
+    const badge = document.getElementById("rec-hourly-badge");
+    if (recEst === "w") {
+      badge.className = "method-badge badge-weighted";
+      badge.textContent = "NHANES Survey-Weighted Population Means (95% CI)";
+    } else {
+      badge.className = "method-badge badge-descriptive";
+      badge.textContent = "Unweighted Sample Means (95% CI)";
+    }
+
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 52, r: 22, b: 68, l: 64 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: {
+        domain: [0, 0.47],
+        range: [-0.55, 6.55],
+        tickvals: [0, 1, 2, 3, 4, 5, 6],
+        ticktext: BINS,
+        title: { text: "Usual Nightly Sleep Hours (Males, Ages 16–44)", font: { size: 12, color: "#cbd5e1" } },
+        gridcolor: "rgba(148,163,184,0.10)",
+        zeroline: false
+      },
+      yaxis: {
+        range: yRange,
+        title: { text: yTitle, font: { size: 13, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.12)"
+      },
+      xaxis2: {
+        domain: [0.53, 1.0],
+        anchor: "y2",
+        range: [-0.55, 6.55],
+        tickvals: [0, 1, 2, 3, 4, 5, 6],
+        ticktext: BINS,
+        title: { text: "Usual Nightly Sleep Hours (Females, Ages 16–44)", font: { size: 12, color: "#cbd5e1" } },
+        gridcolor: "rgba(148,163,184,0.10)",
+        zeroline: false
+      },
+      yaxis2: {
+        anchor: "x2",
+        matches: "y",
+        range: yRange,
+        tickfont: { color: "#94a3b8" },
+        gridcolor: "rgba(148,163,184,0.12)"
+      },
+      annotations: [
+        {
+          xref: "paper", yref: "paper", x: 0.235, y: 1.07,
+          xanchor: "center", yanchor: "bottom", showarrow: false,
+          text: "<b style='color:#7dd3fc;font-size:13.5px'>AGES 16–44 MALES</b> <span style='color:#cbd5e1;font-size:12px'>(n = " + REC_DATA.meta.n_young_m.toLocaleString() + ")</span>"
+        },
+        {
+          xref: "paper", yref: "paper", x: 0.765, y: 1.07,
+          xanchor: "center", yanchor: "bottom", showarrow: false,
+          text: "<b style='color:#f9a8d4;font-size:13.5px'>AGES 16–44 FEMALES</b> <span style='color:#cbd5e1;font-size:12px'>(n = " + REC_DATA.meta.n_young_f.toLocaleString() + ")</span>"
+        }
+      ],
+      legend: { orientation: "h", x: 0, y: -0.17, font: { size: 11.5, color: "#e2e8f0" } }
+    };
+
+    Plotly.react("plot-young-hourly", mTraces.concat(fTraces), layout, {
+      responsive: true,
+      displaylogo: false
+    });
+  }
+
+  function renderModelAttenuation() {
+    const M = REC_DATA.models;
+    const modelOrder = [
+      "1. Unadjusted Sample OLS",
+      "2. Sex-Adjusted OLS",
+      "3. Sex × Age-Spline OLS",
+      "4. NHANES Survey-Weighted GLM"
+    ];
+    const modelColors = {
+      "1. Unadjusted Sample OLS": "#64748b",
+      "2. Sex-Adjusted OLS": "#38bdf8",
+      "3. Sex × Age-Spline OLS": "#2dd4bf",
+      "4. NHANES Survey-Weighted GLM": "#a78bfa"
+    };
+    const catOrder = ["Very Short (<=5h)", "Short (6h)", "Long (9+h)"];
+    const catLabels = ["≤5h Very Short\n(vs. 7–8h)", "6h Short\n(vs. 7–8h)", "9+h Long\n(vs. 7–8h)"];
+    const offsets = [-0.21, -0.07, 0.07, 0.21];
+
+    const zeroLine = {
+      type: "scatter",
+      mode: "lines",
+      x: [-0.45, 2.45],
+      y: [0, 0],
+      line: { color: "rgba(248,250,252,0.55)", width: 1.6, dash: "dash" },
+      hoverinfo: "skip",
+      showlegend: false
+    };
+
+    const traces = [zeroLine];
+
+    modelOrder.forEach((mName, mIdx) => {
+      const xs = [];
+      const ys = [];
+      const hiArr = [];
+      const loArr = [];
+      const cdata = [];
+
+      catOrder.forEach((cat, cIdx) => {
+        for (let i = 0; i < M.model.length; i++) {
+          if (M.model[i] === mName && M.category[i] === cat) {
+            xs.push(cIdx + offsets[mIdx]);
+            ys.push(M.est[i]);
+            hiArr.push(Number((M.hi[i] - M.est[i]).toFixed(2)));
+            loArr.push(Number((M.est[i] - M.lo[i]).toFixed(2)));
+            cdata.push([cat, M.lo[i].toFixed(2), M.hi[i].toFixed(2), M.pval[i] < 0.0001 ? "<0.0001" : M.pval[i].toFixed(4)]);
+          }
+        }
+      });
+
+      traces.push({
+        type: "scatter",
+        mode: "markers",
+        name: mName,
+        x: xs,
+        y: ys,
+        customdata: cdata,
+        marker: {
+          size: mIdx === 3 ? 11.5 : 9.5,
+          symbol: mIdx === 3 ? "diamond" : "circle",
+          color: modelColors[mName],
+          line: { color: "#ffffff", width: mIdx === 3 ? 2 : 1.2 }
+        },
+        error_y: {
+          type: "data",
+          symmetric: false,
+          array: hiArr,
+          arrayminus: loArr,
+          visible: true,
+          color: modelColors[mName],
+          thickness: 2.2,
+          width: 5
+        },
+        hovertemplate:
+          "<b>" + mName + "</b><br>" +
+          "Contrast: %{customdata[0]} vs. Recommended (7–8h)<br>" +
+          "Difference: <b>%{y:+.2f} kg</b> [95% CI: %{customdata[1]} to %{customdata[2]} kg]<br>" +
+          "p-value: %{customdata[3]}<extra></extra>"
+      });
+    });
+
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 28, r: 24, b: 64, l: 72 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: {
+        range: [-0.45, 2.45],
+        tickvals: [0, 1, 2],
+        ticktext: catLabels,
+        tickfont: { size: 12.5, color: "#f8fafc" },
+        gridcolor: "rgba(148,163,184,0.08)",
+        zeroline: false
+      },
+      yaxis: {
+        range: [-7.6, 3.6],
+        title: { text: "Difference in Combined Grip vs. 7–8h (kg)", font: { size: 13, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.12)",
+        zeroline: false
+      },
+      legend: { orientation: "h", x: 0, y: 1.12, font: { size: 11.5, color: "#e2e8f0" } }
+    };
+
+    Plotly.react("plot-model-attenuation", traces, layout, {
+      responsive: true,
+      displaylogo: false
+    });
+  }
+
+  window.setRecMetric = function (m) {
+    recMetric = m;
+    document.getElementById("rec-metric-cg").classList.toggle("active", m === "cg");
+    document.getElementById("rec-metric-mg").classList.toggle("active", m === "mg");
+    renderYoungHourly();
+  };
+
+  window.setRecEst = function (e) {
+    recEst = e;
+    document.getElementById("rec-est-w").classList.toggle("active", e === "w");
+    document.getElementById("rec-est-u").classList.toggle("active", e === "u");
+    renderYoungHourly();
+  };
+
+  document.addEventListener("DOMContentLoaded", function () {
+    renderYoungHourly();
+    renderModelAttenuation();
+  });
+})();
+</script>
+```

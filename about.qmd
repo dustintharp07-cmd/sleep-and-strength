@@ -1,0 +1,366 @@
+---
+title: "About — Sleep & Physical Strength"
+---
+
+```{r}
+library(tidyverse)
+library(haven)
+library(survey)
+library(scales)
+
+df <- read_rds("data/processed/nhanes_sleep_strength.rds")
+sample_flow <- read_csv("data/processed/sample_flow.csv", show_col_types = FALSE)
+
+demo_mec <- bind_rows(
+  read_xpt("data/raw/DEMO_G.XPT") |> mutate(cycle = "2011-2012") |> select(SEQN, cycle, SDMVPSU, SDMVSTRA, WTMEC2YR),
+  read_xpt("data/raw/DEMO_H.XPT") |> mutate(cycle = "2013-2014") |> select(SEQN, cycle, SDMVPSU, SDMVSTRA, WTMEC2YR)
+) |>
+  filter(WTMEC2YR > 0) |>
+  mutate(mec_weight_4yr = WTMEC2YR / 2) |>
+  left_join(df |> select(-cycle, -mec_weight_4yr) |> mutate(in_cohort = TRUE), by = "SEQN") |>
+  mutate(in_cohort = coalesce(in_cohort, FALSE))
+
+des_mec_full <- svydesign(
+  id = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~mec_weight_4yr,
+  nest = TRUE, data = demo_mec
+)
+des_analytic <- subset(des_mec_full, in_cohort)
+
+n_total <- nrow(df)
+n_male <- sum(df$sex == "Male")
+n_female <- sum(df$sex == "Female")
+n_top80 <- sum(df$age == 80)
+n_75plus <- sum(df$age_group == "75-80+")
+n_mec_universe <- nrow(demo_mec)
+n_strata <- n_distinct(demo_mec$SDMVSTRA)
+n_psu <- n_distinct(paste(demo_mec$SDMVSTRA, demo_mec$SDMVPSU))
+n_degf <- as.integer(degf(des_analytic))
+
+# Programmatic missingness table across analytical dataset variables
+missing_summary <- tibble(
+  variable = c(
+    "Core Analytical Variables (SEQN, age, sex, sleep_hours, combined_grip_kg, max_hand_grip_kg, race_ethnicity, mec_weight_4yr)",
+    "trouble_sleeping (SLQ050 — Told doctor trouble sleeping)",
+    "sleep_disorder (SLQ060 — Told by doctor have sleep disorder)",
+    "income_pir (INDFMPIR — Family income-to-poverty ratio)"
+  ),
+  complete_n = c(
+    n_total,
+    sum(!is.na(df$trouble_sleeping)),
+    sum(!is.na(df$sleep_disorder)),
+    sum(!is.na(df$income_pir))
+  ),
+  missing_n = c(
+    0L,
+    sum(is.na(df$trouble_sleeping)),
+    sum(is.na(df$sleep_disorder)),
+    sum(is.na(df$income_pir))
+  ),
+  handling = c(
+    "Required for cohort inclusion (100% complete across N = 10,987)",
+    "NHANES codes 7/9 recoded to NA; excluded via domain subset() when analyzing SLQ050",
+    "NHANES codes 7/9 recoded to NA; excluded via domain subset() when analyzing SLQ060",
+    "Unreported household income retained as NA in master file; complete-case domain subset (n = 10,119) used for PIR analyses"
+  )
+) |>
+  mutate(missing_pct = sprintf("%.2f%%", (missing_n / n_total) * 100))
+```
+
+<div class="platform-shell">
+
+<!-- PAGE HEADER -->
+<section class="hero-section" style="padding: 2.15rem 2.35rem;">
+<div class="eyebrow-badge">
+Project Documentation &middot; Author, Provenance &amp; Survey Methodology
+</div>
+<h1 class="hero-title" style="font-size: clamp(1.85rem, 3.4vw, 2.75rem);">
+About <span class="gradient-text">Sleep &amp; Physical Strength</span>
+</h1>
+<p class="hero-subtitle" style="margin-bottom: 0;">
+Documentation of project authorship, CDC/NCHS National Health and Nutrition Examination Survey (NHANES 2011–2014) data provenance, variable definitions, sample construction, missing-data accounting, complex multistage survey estimation, and full computational reproducibility.
+</p>
+</section>
+
+<!-- AUTHOR & PROJECT OVERVIEW -->
+<div class="info-grid-2" style="margin-bottom: 1.75rem;">
+<section class="glass-card" style="margin-bottom: 0;">
+<div class="section-kicker">Author &amp; Affiliation</div>
+<h2 class="section-title" style="margin-bottom: 0.65rem;">Dustin Tharp</h2>
+<div class="prose-block">
+<p>
+<strong>Institution:</strong> New College of Florida<br>
+<strong>Email:</strong> <a href="mailto:bubbat07@icloud.com" style="color: #38bdf8; text-decoration: none;">bubbat07@icloud.com</a><br>
+<strong>GitHub:</strong> <a href="https://github.com/dustintharp07" target="_blank" rel="noopener" style="color: #38bdf8; text-decoration: none;">@dustintharp07</a><br>
+<strong>Source Repository:</strong> <a href="https://github.com/dustintharp07/sleep-and-strength" target="_blank" rel="noopener" style="color: #2dd4bf; text-decoration: none;">github.com/dustintharp07/sleep-and-strength</a>
+</p>
+<p style="font-size: 0.92rem; color: #94a3b8;">
+Developed in R, the tidyverse, the <code>survey</code> package, Plotly, and Quarto as an empirical data-science investigation into sleep habits and physical strength.
+</p>
+</div>
+</section>
+
+<section class="glass-card" style="margin-bottom: 0;">
+<div class="section-kicker">Research Arc &amp; Observational Scope</div>
+<h2 class="section-title" style="margin-bottom: 0.65rem;">Project Motivation &amp; Limitations</h2>
+<div class="prose-block">
+<p>
+This project began with a question rooted in athletic performance and recovery—whether habitual short sleep aligns with lower physical force—and broadened into an examination of upper-body strength across biological sex and the human lifespan (`ages 16–80+`).
+</p>
+<p style="font-size: 0.92rem; color: #94a3b8;">
+<strong>Key study limitations:</strong> NHANES is a cross-sectional observational survey, so associations cannot establish causality or rule out reverse causation (such as underlying illness increasing sleep duration in older age). Sleep duration (`SLD010H`) is self-reported in whole hours rather than actigraphy-measured, and unmerged NHANES modules—such as body anthropometric measures (`BMX`) and physical activity (`PAQ`)—are outside the three-module scope of this repository.
+</p>
+</div>
+</section>
+</div>
+
+<!-- DATA SOURCES -->
+<section class="glass-card">
+<div class="section-kicker">Data Provenance</div>
+<h2 class="section-title" style="margin-bottom: 0.5rem;">CDC/NCHS NHANES 2011–2014 Public-Use Data Sources</h2>
+<div class="prose-block">
+<p>
+All analyses use public-use SAS transport (`.XPT`) files published by the Centers for Disease Control and Prevention (CDC) National Center for Health Statistics (NCHS) across two consecutive two-year waves: <strong>2011–2012 (Cycle G)</strong> and <strong>2013–2014 (Cycle H)</strong>. These two waves constitute the dedicated NHANES cycles in which objective bilateral handgrip dynamometry was administered in the Mobile Examination Center (MEC). Raw files are stored unmodified in <code>data/raw/</code> and merged deterministically by respondent sequence number (<code>SEQN</code>) in <code>scripts/prepare_data.R</code>:
+</p>
+</div>
+
+<div class="info-grid-3">
+<div class="mini-panel">
+<span class="code-tag">DEMO_G.XPT &amp; DEMO_H.XPT</span>
+<h4>Demographics &amp; Survey Design</h4>
+<p style="font-size: 0.88rem; color: #cbd5e1; margin: 0;">
+Provides examinee age (`RIDAGEYR`, top-coded at `80`), biological sex (`RIAGENDR`), race/Hispanic origin (`RIDRETH3`), family income-to-poverty ratio (`INDFMPIR`), 2-year MEC exam weights (`WTMEC2YR`), masked variance pseudo-strata (`SDMVSTRA`), and pseudo-PSUs (`SDMVPSU`).
+</p>
+</div>
+
+<div class="mini-panel">
+<span class="code-tag">SLQ_G.XPT &amp; SLQ_H.XPT</span>
+<h4>Sleep Disorders Questionnaire</h4>
+<p style="font-size: 0.88rem; color: #cbd5e1; margin: 0;">
+Administered during the household interview to participants aged `16` and older. Captures usual weekday/workday sleep hours (`SLD010H`), whether the participant ever told a doctor they had trouble sleeping (`SLQ050`), and physician-diagnosed sleep disorders (`SLQ060`).
+</p>
+</div>
+
+<div class="mini-panel">
+<span class="code-tag">MGX_G.XPT &amp; MGX_H.XPT</span>
+<h4>Muscle Strength — Grip Test</h4>
+<p style="font-size: 0.88rem; color: #cbd5e1; margin: 0;">
+Objective isometric upper-body strength measured in the MEC using a Takei Digital Grip Strength Dynamometer across three trials per hand (`MGXH1T1–MGXH2T3`), yielding CDC's combined grip metric (`MGDCGSZ`, sum of the best reading from each hand).
+</p>
+</div>
+</div>
+</section>
+
+<!-- VARIABLE DICTIONARY -->
+<section class="glass-card">
+<div class="section-kicker">Codebook</div>
+<h2 class="section-title" style="margin-bottom: 0.5rem;">Analytical Variable Dictionary</h2>
+<p class="section-desc" style="margin-bottom: 0.85rem;">
+Definitions, units, and recoding rules for variables in <code>data/processed/nhanes_sleep_strength.rds</code> (`N = `r comma(n_total)` examinees) and joined survey-design identifiers.
+</p>
+
+<div style="overflow-x: auto;">
+<table class="dark-table">
+<thead>
+<tr>
+<th>Analytical Variable</th>
+<th>NHANES Source</th>
+<th>Measurement &amp; Coding</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SEQN</code>, <code>cycle</code></td>
+<td><code>DEMO_G/H</code></td>
+<td>Unique respondent identifier merged across modules; survey wave indicator (`2011-2012` vs. `2013-2014`).</td>
+</tr>
+<tr>
+<td><code>age</code>, <code>age_group</code></td>
+<td><code>RIDAGEYR</code></td>
+<td>Age in years at screening (`16` to `80`; `n = `r comma(n_top80)`` examinees aged `80+` in our final cohort are top-coded at `80` by NCHS). Grouped into `16-29`, `30-44`, `45-59`, `60-74`, and `75-80+` (`n = `r comma(n_75plus)`` total in `75-80+`).</td>
+</tr>
+<tr>
+<td><code>sex</code></td>
+<td><code>RIAGENDR</code></td>
+<td>Biological sex coded `1 = Male` (`n = `r comma(n_male)``), `2 = Female` (`n = `r comma(n_female)``).</td>
+</tr>
+<tr>
+<td><code>sleep_hours</code>, <code>sleep_category</code></td>
+<td><code>SLD010H</code></td>
+<td>Self-reported usual weekday/workday sleep duration in whole hours (`2` to `12+`; special codes `77` Refused and `99` Don't Know recoded to `NA`). Grouped into `Very Short (<=5h)`, `Short (6h)`, `Recommended (7-8h)`, and `Long (9+h)`.</td>
+</tr>
+<tr>
+<td><code>combined_grip_kg</code></td>
+<td><code>MGDCGSZ</code></td>
+<td>Primary strength outcome (`kg`): sum of the largest dynamometer reading from the left hand and right hand across three alternating trials per hand (`MGDEXSTS == 1` complete bilateral test).</td>
+</tr>
+<tr>
+<td><code>max_hand_grip_kg</code></td>
+<td><code>MGXH1T1–MGXH2T3</code></td>
+<td>Secondary strength metric (`kg`): maximum single-hand isometric reading across all six recorded trials.</td>
+</tr>
+<tr>
+<td><code>race_ethnicity</code></td>
+<td><code>RIDRETH3</code></td>
+<td>Six-category NHANES race/Hispanic origin classification including Non-Hispanic Asian oversample (`2011–2014`).</td>
+</tr>
+<tr>
+<td><code>trouble_sleeping</code>, <code>sleep_disorder</code></td>
+<td><code>SLQ050</code>, <code>SLQ060</code></td>
+<td>Binary (`Yes` / `No`) indicators for ever telling a doctor about trouble sleeping (`SLQ050`) or being told by a doctor of a sleep disorder (`SLQ060`); codes `7`/`9` recoded to `NA`.</td>
+</tr>
+<tr>
+<td><code>income_pir</code></td>
+<td><code>INDFMPIR</code></td>
+<td>Ratio of family income to federal poverty threshold (`0.00` to `5.00`, top-coded at `5.00`).</td>
+</tr>
+<tr>
+<td><code>mec_weight_4yr</code>, <code>SDMVSTRA</code>, <code>SDMVPSU</code></td>
+<td><code>DEMO_G/H</code></td>
+<td>Four-year MEC examination weight (`WTMEC2YR / 2` per NCHS analytic guidelines for combining two 2-year waves), masked variance stratum (`29` non-overlapping strata), and nested primary sampling unit (`61` PSUs).</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<!-- SAMPLE FLOW & MISSINGNESS TABLES -->
+<div class="info-grid-2" style="margin-bottom: 1.75rem;">
+<section class="glass-card" style="margin-bottom: 0;">
+<div class="section-kicker">Cohort Construction</div>
+<h2 class="section-title" style="font-size: 1.28rem; margin-bottom: 0.45rem;">Sample-Flow Accounting (`19,931` &rarr; `10,987`)</h2>
+<p class="section-desc" style="font-size: 0.88rem; margin-bottom: 0.75rem;">
+Exact participant filtering stages generated by <code>scripts/prepare_data.R</code> and stored in <code>data/processed/sample_flow.csv</code>.
+</p>
+<div style="overflow-x: auto;">
+<table class="dark-table">
+<thead>
+<tr>
+<th>Filtering Stage</th>
+<th style="text-align: right;">Examinees (N)</th>
+</tr>
+</thead>
+<tbody>
+```{r}
+#| results: asis
+for (i in seq_len(nrow(sample_flow))) {
+  st <- sample_flow$step[i]
+  nv <- sample_flow$n[i]
+  disp_n <- if (str_starts(st, "Excluded:")) paste0("&minus;", comma(nv)) else comma(nv)
+  cat(paste0(
+    "<tr>",
+    "<td>", st, "</td>",
+    "<td style='text-align:right;font-variant-numeric:tabular-nums;'>", disp_n, "</td>",
+    "</tr>\n"
+  ))
+}
+```
+</tbody>
+</table>
+</div>
+</section>
+
+<section class="glass-card" style="margin-bottom: 0;">
+<div class="section-kicker">Data Completeness</div>
+<h2 class="section-title" style="font-size: 1.28rem; margin-bottom: 0.45rem;">Item-Level Missingness Within `N = 10,987`</h2>
+<p class="section-desc" style="font-size: 0.88rem; margin-bottom: 0.75rem;">
+Secondary covariates with incomplete responses are preserved in the master dataset and subset transparently during specific analyses.
+</p>
+<div style="overflow-x: auto;">
+<table class="dark-table">
+<thead>
+<tr>
+<th>Variable</th>
+<th style="text-align: right;">Valid n</th>
+<th style="text-align: right;">Missing (%)</th>
+</tr>
+</thead>
+<tbody>
+```{r}
+#| results: asis
+for (i in seq_len(nrow(missing_summary))) {
+  r <- missing_summary[i, ]
+  cat(paste0(
+    "<tr>",
+    "<td><strong>", r$variable, "</strong><br><span style='font-size:0.79rem;color:#94a3b8;'>", r$handling, "</span></td>",
+    "<td style='text-align:right;font-variant-numeric:tabular-nums;vertical-align:top;'>", comma(r$complete_n), "</td>",
+    "<td style='text-align:right;font-variant-numeric:tabular-nums;vertical-align:top;'>", comma(r$missing_n), " (", r$missing_pct, ")</td>",
+    "</tr>\n"
+  ))
+}
+```
+</tbody>
+</table>
+</div>
+</section>
+</div>
+
+<!-- SURVEY DESIGN & UNWEIGHTED VS WEIGHTED EXPLANATION -->
+<section class="glass-card">
+<div class="section-kicker">Statistical Methodology</div>
+<h2 class="section-title" style="margin-bottom: 0.5rem;">Combined NHANES Complex Survey Design &amp; Estimation Modes</h2>
+<div class="prose-block">
+<p>
+NHANES uses a stratified, multistage probability cluster design rather than simple random sampling. Following CDC/NCHS analytic guidelines for combining the 2011–2012 and 2013–2014 cycles, four-year Mobile Examination Center weights are constructed as <code>mec_weight_4yr = WTMEC2YR / 2</code>. Stratum identifiers (<code>SDMVSTRA</code>) are uniquely numbered across waves (`90–103` in 2011–2012; `104–118` in 2013–2014; zero overlap), with primary sampling units (<code>SDMVPSU</code>) nested within strata (`r n_strata` strata, `r n_psu` PSUs, `r n_degf` design degrees of freedom). To preserve full variance structure during subpopulation analysis, <code>survey::svydesign(..., nest = TRUE)</code> is initialized on all `r comma(n_mec_universe)` MEC-examined respondents (`WTMEC2YR > 0`) and restricted to the `r comma(n_total)`-examinee cohort via <code>subset()</code>.
+</p>
+<p>
+<strong>Unweighted sample estimates vs. survey-weighted population estimates:</strong> Unweighted visualizations and sample statistics describe the exact `r comma(n_total)` individuals examined in NHANES—a cohort in which NCHS intentionally oversamples Non-Hispanic Black, Hispanic, Non-Hispanic Asian, low-income, and older participants to ensure reliable subgroup precision. Survey-weighted population estimates reweight observations by <code>mec_weight_4yr</code> to represent the civilian, non-institutionalized U.S. population aged `16+` and compute Taylor-series linearized standard errors and confidence intervals accounting for PSU clustering and stratification. Every visualization and regression table on this site explicitly labels which estimation mode is displayed.
+</p>
+</div>
+</section>
+
+<!-- REPRODUCIBILITY IN A FRESH CODESPACE -->
+<section class="glass-card">
+<div class="section-kicker">Computational Reproducibility</div>
+<h2 class="section-title" style="margin-bottom: 0.5rem;">Reproducing the Website in a Fresh Codespace</h2>
+<div class="prose-block">
+<p>
+All R package dependencies (including <code>tidyverse</code>, <code>haven</code>, <code>survey</code>, <code>plotly</code>, <code>jsonlite</code>, <code>splines</code>, <code>broom</code>, <code>knitr</code>, and <code>scales</code>) are declared in the root <code>DESCRIPTION</code> file. From a fresh GitHub Codespace or local R/Quarto environment, run the following three commands at the terminal:
+</p>
+</div>
+
+<div class="mini-panel" style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.86rem; color: #e2e8f0; line-height: 1.75; overflow-x: auto;">
+# 1. Install all documented R dependencies (including survey >= 4.2)<br>
+Rscript -e 'pak::local_install_deps()'<br><br>
+# 2. (Optional) Re-generate data/processed/nhanes_sleep_strength.rds from raw CDC XPT files<br>
+Rscript scripts/prepare_data.R<br><br>
+# 3. Render all six pages of the Quarto website into _site/<br>
+quarto render
+</div>
+</section>
+
+<!-- SCIENTIFIC & METHODOLOGICAL REFERENCES -->
+<section class="glass-card" id="references" style="margin-bottom: 0;">
+<div class="section-kicker">Bibliography</div>
+<h2 class="section-title" style="margin-bottom: 0.5rem;">Scientific Literature &amp; CDC/NCHS Methodological References</h2>
+<p class="section-desc" style="margin-bottom: 0.9rem;">
+Peer-reviewed studies and official survey manuals cited across the website to distinguish prior background research from our empirical NHANES 2011–2014 calculations.
+</p>
+<div class="prose-block" style="font-size: 0.91rem;">
+<p>
+<strong>Bohannon, R. W. (2019).</strong> Grip strength: An indispensable biomarker for older adults. <em>Clinical Interventions in Aging</em>, 14, 1681–1691. <a href="https://doi.org/10.2147/CIA.S194543" target="_blank" rel="noopener" style="color: #38bdf8; text-decoration: none;">https://doi.org/10.2147/CIA.S194543</a>
+</p>
+<p>
+<strong>CDC / National Center for Health Statistics (2013).</strong> <em>National Health and Nutrition Examination Survey (NHANES): Muscle Strength Procedures Manual</em>. Hyattsville, MD: U.S. Department of Health and Human Services. <a href="https://wwwn.cdc.gov/nchs/data/nhanes/2013-2014/manuals/Muscle_Strength_2013.pdf" target="_blank" rel="noopener" style="color: #38bdf8; text-decoration: none;">CDC MGX Protocol PDF</a>
+</p>
+<p>
+<strong>CDC / National Center for Health Statistics (2018; Chen et al., 2020).</strong> <em>NHANES Analytic Guidelines, 2011–2014 and 2015–2016</em>, and <em>Vital and Health Statistics</em>, Series 2, No. 184. <a href="https://wwwn.cdc.gov/nchs/nhanes/analyticguidelines.aspx" target="_blank" rel="noopener" style="color: #38bdf8; text-decoration: none;">NCHS Analytic Guidelines</a>
+</p>
+<p>
+<strong>Craven, J., McCartney, D., Desbrow, B., Sabapathy, S., Bellinger, P., Roberts, L., &amp; Irwin, C. (2022).</strong> Effects of acute sleep loss on physical performance: A systematic and meta-analytical review. <em>Sports Medicine</em>, 52(11), 2669–2690. <a href="https://doi.org/10.1007/s40279-022-01706-y" target="_blank" rel="noopener" style="color: #38bdf8; text-decoration: none;">https://doi.org/10.1007/s40279-022-01706-y</a>
+</p>
+<p>
+<strong>Dodds, R. M., Syddall, H. E., Cooper, R., Benzeval, M., Deary, I. J., Dennison, E. M., et al. (2014).</strong> Grip strength across the life course: Normative data from twelve British studies. <em>PLOS ONE</em>, 9(12), e113637. <a href="https://doi.org/10.1371/journal.pone.0113637" target="_blank" rel="noopener" style="color: #38bdf8; text-decoration: none;">https://doi.org/10.1371/journal.pone.0113637</a>
+</p>
+<p>
+<strong>Knowles, O. E., Drinkwater, E. J., Urwin, C. S., Lamon, S., &amp; Aisbett, B. (2018).</strong> Inadequate sleep and muscle strength: Implications for resistance training. <em>Journal of Science and Medicine in Sport</em>, 21(9), 959–968. <a href="https://doi.org/10.1016/j.jsams.2018.01.012" target="_blank" rel="noopener" style="color: #38bdf8; text-decoration: none;">https://doi.org/10.1016/j.jsams.2018.01.012</a>
+</p>
+<p>
+<strong>Patel, S. R., Malhotra, A., Gottlieb, D. J., White, D. P., &amp; Hu, F. B. (2006).</strong> Correlates of long sleep duration. <em>Sleep</em>, 29(7), 881–889. <a href="https://doi.org/10.1093/sleep/29.7.881" target="_blank" rel="noopener" style="color: #38bdf8; text-decoration: none;">https://doi.org/10.1093/sleep/29.7.881</a>
+</p>
+<p>
+<strong>Watson, N. F., Badr, M. S., Belenky, G., Bliwise, D. L., Buxton, O. M., Buysse, D., et al. (2015).</strong> Recommended amount of sleep for a healthy adult: A joint consensus statement of the American Academy of Sleep Medicine and Sleep Research Society. <em>Sleep</em>, 38(6), 843–844. <a href="https://doi.org/10.5665/sleep.4716" target="_blank" rel="noopener" style="color: #38bdf8; text-decoration: none;">https://doi.org/10.5665/sleep.4716</a>
+</p>
+</div>
+</section>
+
+</div>

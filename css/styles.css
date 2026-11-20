@@ -7,16 +7,20 @@
 :root {
   --bg-obsidian: #050811;
   --bg-surface: #0b1120;
-  --bg-card: rgba(13, 21, 38, 0.86);
-  --border-subtle: rgba(56, 189, 248, 0.16);
-  --border-glow: rgba(34, 211, 238, 0.42);
-  --text-primary: #f1f5f9;
-  --text-secondary: #94a3b8;
-  --text-muted: #64748b;
+  --bg-card: rgba(13, 21, 38, 0.90);
+  --bg-card-elevated: rgba(17, 27, 48, 0.94);
+  --border-subtle: rgba(56, 189, 248, 0.18);
+  --border-glow: rgba(34, 211, 238, 0.45);
+  --text-primary: #f8fafc;
+  --text-secondary: #cbd5e1;
+  --text-muted: #94a3b8;
   --accent-blue: #38bdf8;
   --accent-cyan: #22d3ee;
   --accent-teal: #2dd4bf;
   --accent-violet: #a78bfa;
+  --accent-amber: #fbbf24;
+  --sex-male: #38bdf8;
+  --sex-female: #f472b6;
 }
 
 html, body {
@@ -36,6 +40,90 @@ html, body {
 
 #title-block-header {
   display: none;
+}
+
+/* Quarto Multipage Navbar & Footer Integration */
+#quarto-header {
+  border-bottom: 1px solid rgba(56, 189, 248, 0.20);
+  background: rgba(5, 8, 17, 0.90) !important;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+.navbar {
+  background: transparent !important;
+  padding: 0.65rem 1.25rem !important;
+}
+
+.navbar > .container-fluid,
+.navbar > .navbar-container {
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+.navbar-brand-container {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.navbar-logo {
+  max-height: 28px !important;
+  width: auto;
+}
+
+.navbar-brand .navbar-title {
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  font-size: 0.98rem;
+  text-transform: uppercase;
+  background: linear-gradient(90deg, #38bdf8, #2dd4bf, #a78bfa);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.navbar-nav {
+  gap: 0.3rem;
+  align-items: center;
+}
+
+.navbar-nav .nav-link {
+  color: #cbd5e1 !important;
+  font-weight: 600;
+  font-size: 0.88rem;
+  padding: 0.42rem 0.92rem !important;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  transition: all 0.18s ease;
+}
+
+.navbar-nav .nav-link:hover,
+.navbar-nav .nav-link:focus {
+  color: #ffffff !important;
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.22);
+}
+
+.navbar-nav .nav-link.active,
+.navbar-nav .show > .nav-link {
+  color: #ffffff !important;
+  background: rgba(56, 189, 248, 0.18) !important;
+  border-color: rgba(34, 211, 238, 0.44) !important;
+  box-shadow: 0 0 16px rgba(34, 211, 238, 0.16);
+}
+
+.nav-footer {
+  background: rgba(5, 8, 17, 0.92) !important;
+  border-top: 1px solid rgba(56, 189, 248, 0.16) !important;
+  color: var(--text-muted) !important;
+  font-size: 0.83rem;
+  padding: 1.15rem 1.25rem !important;
+}
+
+.nav-footer-left,
+.nav-footer-right,
+.nav-footer-center {
+  color: var(--text-muted) !important;
 }
 
 /* Custom Sticky Platform Topbar */
@@ -393,26 +481,117 @@ html, body {
 .chip-group {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.4rem;
+  gap: 0.5rem;
+}
+
+.sleep-chip-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
+.age-chip-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.5rem;
 }
 
 .chip-toggle {
-  background: rgba(8, 14, 28, 0.9);
-  color: #94a3b8;
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  border-radius: 8px;
-  padding: 0.32rem 0.65rem;
-  font-size: 0.79rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  white-space: nowrap;
+  background: rgba(8, 14, 28, 0.92);
+  color: #cbd5e1;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 9px;
+  padding: 0.44rem 0.72rem;
+  font-size: 0.81rem;
   font-weight: 600;
   cursor: pointer;
   transition: all 0.16s ease;
   user-select: none;
 }
 
+.chip-toggle:hover {
+  border-color: rgba(56, 189, 248, 0.55);
+  color: #ffffff;
+}
+
 .chip-toggle.selected {
-  background: rgba(34, 211, 238, 0.16);
-  color: #f8fafc;
+  background: rgba(34, 211, 238, 0.18);
+  color: #ffffff;
   border-color: var(--accent-cyan);
+  box-shadow: 0 0 12px rgba(34, 211, 238, 0.14);
+}
+
+/* Structured Explorer Control Groups */
+.explorer-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding-bottom: 0.9rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+.explorer-modes-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem;
+  margin-top: 0.9rem;
+}
+
+.mode-group-box {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  background: rgba(8, 13, 26, 0.72);
+  border: 1px solid rgba(56, 189, 248, 0.16);
+  border-radius: 12px;
+  padding: 0.5rem 0.75rem;
+}
+
+.mode-group-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  margin-right: 0.2rem;
+}
+
+.explorer-chips-row {
+  display: grid;
+  grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.25fr);
+  gap: 1rem;
+  margin-top: 0.95rem;
+}
+
+.filter-subpanel {
+  background: rgba(8, 13, 26, 0.62);
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  border-radius: 13px;
+  padding: 0.85rem 0.95rem;
+}
+
+.explorer-selects-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.95rem;
+  margin-top: 0.95rem;
+}
+
+@media (max-width: 1180px) {
+  .explorer-chips-row {
+    grid-template-columns: 1fr;
+  }
+  .sleep-chip-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 /* Info Grids */
@@ -527,8 +706,95 @@ html, body {
   margin-bottom: 1.5rem;
 }
 
+/* Methodological Badges & Sample Accounting Callouts */
+.method-badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+}
+
+.method-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.73rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.24rem 0.68rem;
+  border-radius: 999px;
+}
+
+.badge-descriptive {
+  color: #7dd3fc;
+  background: rgba(56, 189, 248, 0.13);
+  border: 1px solid rgba(56, 189, 248, 0.34);
+}
+
+.badge-adjusted {
+  color: #6ee7b7;
+  background: rgba(45, 212, 191, 0.13);
+  border: 1px solid rgba(45, 212, 191, 0.34);
+}
+
+.badge-weighted {
+  color: #ddd6fe;
+  background: rgba(167, 139, 250, 0.15);
+  border: 1px solid rgba(167, 139, 250, 0.38);
+}
+
+.badge-sample {
+  color: #e2e8f0;
+  background: rgba(30, 41, 59, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.30);
+  font-variant-numeric: tabular-nums;
+}
+
+.sex-pill-male {
+  color: #7dd3fc;
+  font-weight: 700;
+}
+
+.sex-pill-female {
+  color: #f9a8d4;
+  font-weight: 700;
+}
+
+.finding-note {
+  background: rgba(15, 23, 42, 0.82);
+  border-left: 3px solid var(--accent-teal);
+  border-top: 1px solid rgba(45, 212, 191, 0.18);
+  border-right: 1px solid rgba(45, 212, 191, 0.18);
+  border-bottom: 1px solid rgba(45, 212, 191, 0.18);
+  border-radius: 0 12px 12px 0;
+  padding: 0.9rem 1.15rem;
+  margin-top: 1rem;
+  font-size: 0.91rem;
+  color: var(--text-secondary);
+}
+
+.finding-note strong {
+  color: var(--text-primary);
+}
+
+.prose-block p {
+  color: var(--text-secondary);
+  font-size: 0.98rem;
+  line-height: 1.72;
+  margin: 0 0 0.95rem 0;
+}
+
+.prose-block p:last-child {
+  margin-bottom: 0;
+}
+
 @media (max-width: 992px) {
   .kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .explorer-selects-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .info-grid-3, .info-grid-2 {
@@ -540,13 +806,35 @@ html, body {
   .topbar-meta {
     display: none;
   }
+  .navbar-collapse {
+    padding-top: 0.65rem;
+  }
+  .navbar-nav {
+    align-items: stretch;
+  }
+  .navbar-nav .nav-link {
+    border-radius: 10px;
+  }
 }
 
 @media (max-width: 576px) {
-  .kpi-grid {
+  .kpi-grid,
+  .explorer-selects-grid,
+  .sleep-chip-grid {
     grid-template-columns: 1fr;
   }
+  .age-chip-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
   .glass-card {
-    padding: 1.2rem 1.1rem;
+    padding: 1.2rem 1.05rem;
+  }
+  .method-badge {
+    font-size: 0.68rem;
+    line-height: 1.35;
+  }
+  .pill-btn {
+    padding: 0.36rem 0.72rem;
+    font-size: 0.78rem;
   }
 }

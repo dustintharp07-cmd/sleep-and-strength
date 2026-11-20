@@ -1,17 +1,14 @@
 /* ==========================================================================
-   Sleep & Strength — Interactive Platform Logic (js/app.js)
-   Drives:
-   1. Multi-section SPA navigation (Overview, Interactive Explorer, The Story)
-   2. Homepage Dual-Lens Flagship Visualization (N = 10,987, Ages 16-80+)
-   3. Real-Time Cross-Filtering Data Explorer
+   Sleep & Strength — Interactive Explorer & Legacy SPA Logic (js/app.js)
+   - Sex-separated distributions and trajectories by default
+   - Discrete means + 95% confidence intervals (no unbanded spline curves)
+   - Minimum cell threshold (n >= 10) for reliable subgroup interval display
+   - Transparent sample-size and missingness accounting
    ========================================================================== */
 
-let currentView = "overview";
-let currentLens = "surface";
-let currentSex = "All";
 let activeMetric = "cg";
+let activeWeightMode = "unw"; // "unw" or "wtd"
 let rightPanelMode = "lifespan";
-let explorerInitialized = false;
 
 const selectedAges = new Set(["16-29", "30-44", "45-59", "60-74", "75-80+"]);
 const selectedSleeps = new Set([
@@ -24,70 +21,27 @@ const selectedSleeps = new Set([
 const AGE_PALETTE = {
   "16-29": "#38bdf8",
   "30-44": "#2dd4bf",
-  "45-59": "#a78bfa",
-  "60-74": "#818cf8",
+  "45-59": "#fbbf24",
+  "60-74": "#a78bfa",
   "75-80+": "#f472b6"
 };
 
-const SLEEP_PALETTE = {
-  "Very Short (<=5h)": "#a78bfa",
-  "Short (6h)": "#38bdf8",
-  "Recommended (7-8h)": "#2dd4bf",
-  "Long (9+h)": "#818cf8"
+const SLEEP_SHORT = {
+  "Very Short (<=5h)": "≤5h Very Short",
+  "Short (6h)": "6h Short",
+  "Recommended (7-8h)": "7–8h Rec.",
+  "Long (9+h)": "9+h Long"
 };
 
-/* ---------- Navigation ---------- */
-function switchView(viewName, scrollToId) {
-  currentView = viewName;
-  ["overview", "explorer", "story"].forEach(v => {
-    const sec = document.getElementById("view-" + v);
-    const btn = document.getElementById("nav-btn-" + v);
-    if (sec) sec.classList.toggle("active", v === viewName);
-    if (btn) btn.classList.toggle("active", v === viewName);
-  });
-
-  if (history.replaceState) {
-    history.replaceState(null, "", "#" + viewName);
-  }
-
-  if (viewName === "overview") {
-    setTimeout(() => {
-      const el = document.getElementById("hero-flagship-plot");
-      if (el && window.Plotly) Plotly.Plots.resize(el);
-      if (scrollToId) {
-        const target = document.getElementById(scrollToId);
-        if (target) target.scrollIntoView({ behavior: "smooth" });
-      } else {
-        window.scrollTo({ top: 0, behavior: "smooth" });
-      }
-    }, 30);
-  } else if (viewName === "explorer") {
-    window.scrollTo({ top: 0, behavior: "smooth" });
-    setTimeout(() => {
-      if (!explorerInitialized) {
-        updateExplorer();
-        explorerInitialized = true;
-      } else {
-        ["plot-age-trajectories", "plot-sleep-boxes", "plot-right-panel"].forEach(id => {
-          const el = document.getElementById(id);
-          if (el && window.Plotly) Plotly.Plots.resize(el);
-        });
-      }
-    }, 30);
-  } else {
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  }
-}
-
 /* ---------- Statistical Helpers ---------- */
-function mean(arr) {
+function meanUnw(arr) {
   if (!arr.length) return NaN;
   let s = 0;
   for (let i = 0; i < arr.length; i++) s += arr[i];
   return s / arr.length;
 }
 
-function sd(arr, m) {
+function sdUnw(arr, m) {
   if (arr.length < 2) return 0;
   let s = 0;
   for (let i = 0; i < arr.length; i++) {
@@ -97,15 +51,68 @@ function sd(arr, m) {
   return Math.sqrt(s / (arr.length - 1));
 }
 
-function quantileSorted(sorted, q) {
-  if (!sorted.length) return NaN;
-  const pos = (sorted.length - 1) * q;
-  const base = Math.floor(pos);
-  const rest = pos - base;
-  if (sorted[base + 1] !== undefined) {
-    return sorted[base] + rest * (sorted[base + 1] - sorted[base]);
+function meanWtdAndSE(vals, wts) {
+  const n = vals.length;
+  if (!n) return { mean: NaN, se: NaN };
+  let sumW = 0;
+  let sumWY = 0;
+  for (let i = 0; i < n; i++) {
+    sumW += wts[i];
+    sumWY += wts[i] * vals[i];
   }
-  return sorted[base];
+  const mu = sumWY / sumW;
+  if (n < 2) return { mean: mu, se: 0 };
+  // Kish effective-sample-size Taylor approximation for fast interactive explorer slices
+  let sumW2 = 0;
+  let numVar = 0;
+  for (let i = 0; i < n; i++) {
+    sumW2 += wts[i] * wts[i];
+    const diff = vals[i] - mu;
+    numVar += wts[i] * diff * diff;
+  }
+  const s2 = numVar / sumW;
+  const nEff = (sumW * sumW) / sumW2;
+  const se = nEff > 1 ? Math.sqrt(s2 / (nEff - 1)) : 0;
+  return { mean: mu, se: se };
+}
+
+function summarizeGroup(indices) {
+  const n = indices.length;
+  if (n === 0) return { n: 0, mean: NaN, ci: NaN, med: NaN, q25: NaN, q75: NaN };
+  const vals = indices.map(i => RAW[activeMetric][i]);
+  const sorted = vals.slice().sort((a, b) => a - b);
+  const qAt = q => {
+    const pos = (sorted.length - 1) * q;
+    const base = Math.floor(pos);
+    const rest = pos - base;
+    return sorted[base + 1] !== undefined
+      ? sorted[base] + rest * (sorted[base + 1] - sorted[base])
+      : sorted[base];
+  };
+
+  if (activeWeightMode === "wtd" && RAW.w) {
+    const wts = indices.map(i => RAW.w[i]);
+    const wm = meanWtdAndSE(vals, wts);
+    return {
+      n: n,
+      mean: wm.mean,
+      ci: 1.96 * wm.se,
+      med: qAt(0.5),
+      q25: qAt(0.25),
+      q75: qAt(0.75)
+    };
+  }
+
+  const m = meanUnw(vals);
+  const s = sdUnw(vals, m);
+  return {
+    n: n,
+    mean: m,
+    ci: n > 1 ? 1.96 * (s / Math.sqrt(n)) : 0,
+    med: qAt(0.5),
+    q25: qAt(0.25),
+    q75: qAt(0.75)
+  };
 }
 
 function sleepBinLabel(h) {
@@ -114,212 +121,7 @@ function sleepBinLabel(h) {
   return h + "h";
 }
 
-/* ---------- Homepage Flagship Visual ---------- */
-function renderHeroSurface() {
-  const d = HERO_DATA.surface[currentSex];
-  const colorscale = [
-    [0.0, "#131836"],
-    [0.25, "#3b2d71"],
-    [0.50, "#0e7490"],
-    [0.75, "#22d3ee"],
-    [1.0, "#2dd4bf"]
-  ];
-
-  const heatTrace = {
-    type: "heatmap",
-    x: d.x,
-    y: d.y,
-    z: d.z,
-    text: d.hover,
-    hoverinfo: "text",
-    zsmooth: "best",
-    colorscale: colorscale,
-    colorbar: {
-      title: { text: "Mean Grip (kg)", font: { color: "#cbd5e1", size: 12 } },
-      tickfont: { color: "#94a3b8" },
-      bgcolor: "rgba(0,0,0,0)",
-      outlinewidth: 0
-    }
-  };
-
-  const peakTrace = {
-    type: "scatter",
-    mode: "lines+markers",
-    name: "Highest-Mean Sleep Tier per Age Band",
-    x: d.peak_x,
-    y: d.peak_y,
-    customdata: d.peak_z,
-    hovertemplate: "<b>%{x}</b> Peak Tier: %{y} (%{customdata} kg)<extra></extra>",
-    line: { color: "#f8fafc", width: 2.5, dash: "dot" },
-    marker: {
-      size: 10,
-      color: "#38bdf8",
-      line: { color: "#ffffff", width: 2 }
-    }
-  };
-
-  const layout = {
-    paper_bgcolor: "rgba(0,0,0,0)",
-    plot_bgcolor: "rgba(8,13,26,0.7)",
-    margin: { t: 28, r: 25, b: 60, l: 75 },
-    font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
-    xaxis: {
-      title: { text: "Participant Age Band (Years, Ages 16–80+)", font: { size: 13, color: "#e2e8f0" } },
-      gridcolor: "rgba(148,163,184,0.10)"
-    },
-    yaxis: {
-      title: { text: "Usual Nightly Sleep Duration", font: { size: 13, color: "#e2e8f0" } },
-      gridcolor: "rgba(148,163,184,0.10)"
-    },
-    legend: {
-      orientation: "h",
-      x: 0,
-      y: 1.08,
-      font: { color: "#e2e8f0", size: 12 }
-    }
-  };
-
-  Plotly.react("hero-flagship-plot", [heatTrace, peakTrace], layout, {
-    responsive: true,
-    displaylogo: false,
-    modeBarButtonsToRemove: ["lasso2d", "select2d"]
-  });
-}
-
-function renderHeroCloud() {
-  const p = HERO_DATA.points;
-  const q = HERO_DATA.quantiles;
-
-  const categories = [
-    "Very Short (<=5h)",
-    "Short (6h)",
-    "Recommended (7-8h)",
-    "Long (9+h)"
-  ];
-  const traces = [];
-
-  categories.forEach(cat => {
-    const idx = [];
-    for (let i = 0; i < p.cat.length; i++) {
-      if (p.cat[i] === cat) idx.push(i);
-    }
-    traces.push({
-      type: "scattergl",
-      mode: "markers",
-      name: cat,
-      x: idx.map(i => p.x[i]),
-      y: idx.map(i => p.y[i]),
-      customdata: idx.map(i => [p.raw_h[i], p.age[i], p.sex[i]]),
-      hovertemplate:
-        "<b>Combined Grip:</b> %{y} kg<br>" +
-        "<b>Sleep:</b> %{customdata[0]} hrs<br>" +
-        "<b>Age & Sex:</b> %{customdata[1]} yrs (%{customdata[2]})<extra></extra>",
-      marker: {
-        size: 4.5,
-        opacity: 0.34,
-        color: SLEEP_PALETTE[cat]
-      }
-    });
-  });
-
-  const qHours = q.map(r => r.sleep_hours);
-
-  traces.push({
-    type: "scatter",
-    mode: "lines",
-    x: qHours,
-    y: q.map(r => r.p75),
-    line: { width: 1, color: "rgba(34,211,238,0.5)" },
-    showlegend: false,
-    hoverinfo: "skip"
-  });
-
-  traces.push({
-    type: "scatter",
-    mode: "lines",
-    name: "Interquartile Band (25th–75th %ile)",
-    x: qHours,
-    y: q.map(r => r.p25),
-    fill: "tonexty",
-    fillcolor: "rgba(34,211,238,0.16)",
-    line: { width: 1, color: "rgba(34,211,238,0.5)" },
-    hovertemplate: "Sleep %{x}h — 25th %ile: %{y} kg<extra></extra>"
-  });
-
-  traces.push({
-    type: "scatter",
-    mode: "lines+markers",
-    name: "Median Combined Grip (50th %ile)",
-    x: qHours,
-    y: q.map(r => r.p50),
-    customdata: q.map(r => [r.mean_g, r.n]),
-    hovertemplate:
-      "<b>%{x} Hours of Sleep</b> (n = %{customdata[1]})<br>" +
-      "Median Grip: %{y} kg<br>" +
-      "Mean Grip: %{customdata[0]} kg<extra></extra>",
-    line: { color: "#ffffff", width: 3 },
-    marker: { size: 8, color: "#22d3ee", line: { color: "#ffffff", width: 2 } }
-  });
-
-  const layout = {
-    paper_bgcolor: "rgba(0,0,0,0)",
-    plot_bgcolor: "rgba(8,13,26,0.7)",
-    margin: { t: 32, r: 25, b: 60, l: 70 },
-    font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
-    xaxis: {
-      title: {
-        text: "Nightly Sleep Duration (Hours, Jittered ±0.3h to Reveal All 10,987 Participants)",
-        font: { size: 13, color: "#e2e8f0" }
-      },
-      tickvals: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-      ticktext: ["2h", "3h", "4h", "5h", "6h", "7h", "8h", "9h", "10h", "11h", "12+h"],
-      gridcolor: "rgba(148,163,184,0.12)"
-    },
-    yaxis: {
-      title: { text: "Combined Bilateral Grip Strength (kg)", font: { size: 13, color: "#e2e8f0" } },
-      gridcolor: "rgba(148,163,184,0.12)"
-    },
-    legend: {
-      orientation: "h",
-      x: 0,
-      y: 1.11,
-      font: { color: "#e2e8f0", size: 11.5 }
-    }
-  };
-
-  Plotly.react("hero-flagship-plot", traces, layout, {
-    responsive: true,
-    displaylogo: false
-  });
-}
-
-function setHeroLens(lens) {
-  currentLens = lens;
-  document.getElementById("lens-surface-btn").classList.toggle("active", lens === "surface");
-  document.getElementById("lens-cloud-btn").classList.toggle("active", lens === "cloud");
-  document.getElementById("sex-toggle-bar").style.display = lens === "surface" ? "flex" : "none";
-
-  const caption = document.getElementById("hero-chart-caption");
-  if (lens === "surface") {
-    caption.textContent =
-      "Smoothed topographic strength surface across seven life-stage bands (ages 16–80+) and seven sleep-duration tiers. Hover any cell for exact sample counts, means, and interquartile ranges, or switch to inspect all 10,987 individual participants.";
-    renderHeroSurface();
-  } else {
-    caption.textContent =
-      "Every one of the 10,987 validated NHANES participants rendered via WebGL alongside the empirical 25th–75th percentile ribbon and median trajectory across nightly sleep hours.";
-    renderHeroCloud();
-  }
-}
-
-function setSurfaceSex(sex) {
-  currentSex = sex;
-  ["All", "Male", "Female"].forEach(s => {
-    document.getElementById("sex-" + s).classList.toggle("active", s === sex);
-  });
-  if (currentLens === "surface") renderHeroSurface();
-}
-
-/* ---------- Interactive Data Explorer ---------- */
+/* ---------- Explorer Controls ---------- */
 function toggleChip(el, kind) {
   const val = el.getAttribute("data-val");
   const targetSet = kind === "age" ? selectedAges : selectedSleeps;
@@ -336,23 +138,50 @@ function toggleChip(el, kind) {
 
 function setMetric(m) {
   activeMetric = m;
-  document.getElementById("metric-cg").classList.toggle("active", m === "cg");
-  document.getElementById("metric-mg").classList.toggle("active", m === "mg");
+  const cgBtn = document.getElementById("metric-cg");
+  const mgBtn = document.getElementById("metric-mg");
+  if (cgBtn) cgBtn.classList.toggle("active", m === "cg");
+  if (mgBtn) mgBtn.classList.toggle("active", m === "mg");
+  updateExplorer();
+}
+
+function setWeightMode(wm) {
+  activeWeightMode = wm;
+  const uBtn = document.getElementById("wmode-unw");
+  const wBtn = document.getElementById("wmode-wtd");
+  if (uBtn) uBtn.classList.toggle("active", wm === "unw");
+  if (wBtn) wBtn.classList.toggle("active", wm === "wtd");
+  const badge = document.getElementById("explorer-method-badge");
+  if (badge) {
+    if (wm === "unw") {
+      badge.className = "method-badge badge-descriptive";
+      badge.textContent = "Unweighted Sample Cross-Filtering (Exact Subgroup n & 95% CI)";
+    } else {
+      badge.className = "method-badge badge-weighted";
+      badge.textContent = "MEC-Weighted Subgroup Means (Effective-n 95% CI; Boxplots Remain Sample Quantiles)";
+    }
+  }
   updateExplorer();
 }
 
 function setRightPanel(mode) {
   rightPanelMode = mode;
-  document.getElementById("subview-lifespan").classList.toggle("active", mode === "lifespan");
-  document.getElementById("subview-demo").classList.toggle("active", mode === "demo");
-  document.getElementById("right-panel-title").textContent =
-    mode === "lifespan"
-      ? "Strength Across the Lifespan (Ages 16–80+)"
-      : "Demographic Subgroup Comparison";
-  document.getElementById("right-panel-desc").textContent =
-    mode === "lifespan"
-      ? "Continuous 5-year age trajectories from 16 to 80+ comparing sleep-duration categories across adulthood."
-      : "Mean grip strength (±95% CI) across NHANES race/Hispanic origin groups stratified by biological sex.";
+  const lBtn = document.getElementById("subview-lifespan");
+  const dBtn = document.getElementById("subview-demo");
+  if (lBtn) lBtn.classList.toggle("active", mode === "lifespan");
+  if (dBtn) dBtn.classList.toggle("active", mode === "demo");
+
+  const titleEl = document.getElementById("right-panel-title");
+  const descEl = document.getElementById("right-panel-desc");
+  if (titleEl && descEl) {
+    if (mode === "lifespan") {
+      titleEl.textContent = "Aging Drives Steep Strength Decline Across Every Sleep Category";
+      descEl.textContent = "Discrete life-stage means (±95% CI, n >= 10) separated by biological sex—without misleading spline smoothing.";
+    } else {
+      titleEl.textContent = "Grip Strength Varies Across Demographic Subgroups Within Each Sex";
+      descEl.textContent = "Subgroup means (±95% CI, n >= 10) across NHANES RIDRETH3 categories separated by Male and Female.";
+    }
+  }
   updateExplorer();
 }
 
@@ -362,165 +191,303 @@ function resetAllFilters() {
     selectedSleeps.add(v)
   );
   document.querySelectorAll(".chip-toggle").forEach(el => el.classList.add("selected"));
-  document.getElementById("sex-select").value = "ALL";
-  document.getElementById("race-select").value = "ALL";
-  document.getElementById("trouble-select").value = "ALL";
-  setMetric("cg");
+  const sexSel = document.getElementById("sex-select");
+  const raceSel = document.getElementById("race-select");
+  const tsSel = document.getElementById("trouble-select");
+  const sdSel = document.getElementById("disorder-select");
+  if (sexSel) sexSel.value = "ALL";
+  if (raceSel) raceSel.value = "ALL";
+  if (tsSel) tsSel.value = "ALL";
+  if (sdSel) sdSel.value = "ALL";
+  activeMetric = "cg";
+  const cgBtn = document.getElementById("metric-cg");
+  const mgBtn = document.getElementById("metric-mg");
+  if (cgBtn) cgBtn.classList.add("active");
+  if (mgBtn) mgBtn.classList.remove("active");
+  setWeightMode("unw");
 }
 
 function getFilteredIndices() {
   const totalN = RAW.a.length;
-  const sexVal = document.getElementById("sex-select").value;
-  const raceVal = document.getElementById("race-select").value;
-  const troubleVal = document.getElementById("trouble-select").value;
+  const sexVal = document.getElementById("sex-select")?.value || "ALL";
+  const raceVal = document.getElementById("race-select")?.value || "ALL";
+  const troubleVal = document.getElementById("trouble-select")?.value || "ALL";
+  const disorderVal = document.getElementById("disorder-select")?.value || "ALL";
   const idx = [];
+  let excludedMissing = 0;
 
   for (let i = 0; i < totalN; i++) {
     if (!selectedAges.has(RAW.ag[i])) continue;
     if (!selectedSleeps.has(RAW.sc[i])) continue;
     if (sexVal !== "ALL" && RAW.s[i] !== sexVal) continue;
     if (raceVal !== "ALL" && RAW.r[i] !== raceVal) continue;
-    if (troubleVal !== "ALL" && RAW.ts[i] !== troubleVal) continue;
+
+    if (troubleVal !== "ALL") {
+      if (RAW.ts[i] === "Missing") {
+        excludedMissing++;
+        continue;
+      }
+      if (RAW.ts[i] !== troubleVal) continue;
+    }
+    if (disorderVal !== "ALL") {
+      if (RAW.sd && RAW.sd[i] === "Missing") {
+        excludedMissing++;
+        continue;
+      }
+      if (RAW.sd && RAW.sd[i] !== disorderVal) continue;
+    }
+
     const val = RAW[activeMetric][i];
     if (val === null || isNaN(val)) continue;
     idx.push(i);
   }
-  return idx;
+  return { idx: idx, excludedMissing: excludedMissing };
 }
 
-function updateKPIs(idx) {
+function updateKPIs(idx, excludedMissing) {
   const totalN = RAW.a.length;
-  const vals = idx.map(i => RAW[activeMetric][i]);
-  const n = vals.length;
-  const metricName = activeMetric === "cg" ? "Combined Grip" : "Max Hand Grip";
-  document.getElementById("kpi-mean-label").textContent = "Mean " + metricName;
+  const n = idx.length;
+  const metricName = activeMetric === "cg" ? "Combined Grip" : "Single-Hand Peak";
+  const sexVal = document.getElementById("sex-select")?.value || "ALL";
+
   document.getElementById("kpi-n").textContent = n.toLocaleString();
+  const pctStr = ((n / totalN) * 100).toFixed(1) + "% of N = " + totalN.toLocaleString();
   document.getElementById("kpi-n-pct").textContent =
-    ((n / totalN) * 100).toFixed(1) + "% of validated sample (10,987)";
+    excludedMissing > 0 ? pctStr + " (" + excludedMissing + " missing excluded)" : pctStr;
+
+  const sampleBadge = document.getElementById("explorer-sample-badge");
+  if (sampleBadge) {
+    const mCount = idx.filter(i => RAW.s[i] === "Male").length;
+    const fCount = idx.filter(i => RAW.s[i] === "Female").length;
+    sampleBadge.textContent =
+      "Active Slice: n = " +
+      n.toLocaleString() +
+      " (" +
+      mCount.toLocaleString() +
+      "M · " +
+      fCount.toLocaleString() +
+      "F)";
+  }
 
   if (n === 0) {
     document.getElementById("kpi-mean").textContent = "—";
     document.getElementById("kpi-sd").textContent = "No matching observations";
     document.getElementById("kpi-median").textContent = "—";
-    document.getElementById("kpi-iqr").textContent = "Adjust filters above";
+    document.getElementById("kpi-iqr").textContent = "Broaden filters above";
     document.getElementById("kpi-gap").textContent = "—";
     return;
   }
 
-  const m = mean(vals);
-  const s = sd(vals, m);
-  const sorted = vals.slice().sort((a, b) => a - b);
-  const med = quantileSorted(sorted, 0.5);
-  const q25 = quantileSorted(sorted, 0.25);
-  const q75 = quantileSorted(sorted, 0.75);
+  const mIdx = idx.filter(i => RAW.s[i] === "Male");
+  const fIdx = idx.filter(i => RAW.s[i] === "Female");
 
-  document.getElementById("kpi-mean").textContent = m.toFixed(1) + " kg";
-  document.getElementById("kpi-sd").textContent = "SD: " + s.toFixed(1) + " kg";
-  document.getElementById("kpi-median").textContent = med.toFixed(1) + " kg";
-  document.getElementById("kpi-iqr").textContent =
-    "IQR (25th–75th): " + q25.toFixed(1) + " – " + q75.toFixed(1) + " kg";
+  document.getElementById("kpi-mean-label").textContent =
+    (activeWeightMode === "wtd" ? "MEC-Weighted Mean " : "Sample Mean ") + metricName;
 
-  const recVals = [];
-  const longVals = [];
-  for (let k = 0; k < idx.length; k++) {
-    const i = idx[k];
-    if (RAW.sc[i] === "Recommended (7-8h)") recVals.push(RAW[activeMetric][i]);
-    else if (RAW.sc[i] === "Long (9+h)") longVals.push(RAW[activeMetric][i]);
-  }
-  if (recVals.length >= 5 && longVals.length >= 5) {
-    const diff = mean(recVals) - mean(longVals);
-    const sign = diff >= 0 ? "+" : "";
-    document.getElementById("kpi-gap").textContent = sign + diff.toFixed(1) + " kg";
-    document.getElementById("kpi-gap-sub").textContent =
-      "7–8h (" + mean(recVals).toFixed(1) + " kg) vs 9+h (" + mean(longVals).toFixed(1) + " kg)";
+  if (sexVal === "ALL" && mIdx.length > 0 && fIdx.length > 0) {
+    const mStat = summarizeGroup(mIdx);
+    const fStat = summarizeGroup(fIdx);
+    document.getElementById("kpi-mean").textContent =
+      mStat.mean.toFixed(1) + " / " + fStat.mean.toFixed(1) + " kg";
+    document.getElementById("kpi-sd").textContent =
+      "Male (n=" + mStat.n.toLocaleString() + ") / Female (n=" + fStat.n.toLocaleString() + ")";
+    document.getElementById("kpi-median").textContent =
+      mStat.med.toFixed(1) + " / " + fStat.med.toFixed(1) + " kg";
+    document.getElementById("kpi-iqr").textContent = "Sex-separated sample medians (M / F)";
   } else {
-    document.getElementById("kpi-gap").textContent = "N/A";
-    document.getElementById("kpi-gap-sub").textContent = "Select both 7–8h and 9+h tiers to compare";
+    const st = summarizeGroup(idx);
+    document.getElementById("kpi-mean").textContent = st.mean.toFixed(1) + " kg";
+    document.getElementById("kpi-sd").textContent = "±" + st.ci.toFixed(1) + " kg (95% CI)";
+    document.getElementById("kpi-median").textContent = st.med.toFixed(1) + " kg";
+    document.getElementById("kpi-iqr").textContent =
+      "Sample IQR: " + st.q25.toFixed(1) + " – " + st.q75.toFixed(1) + " kg";
+  }
+
+  // Sex-aware 7-8h vs 9+h difference
+  const computeGapForSex = subIdx => {
+    const rec = subIdx.filter(i => RAW.sc[i] === "Recommended (7-8h)");
+    const lng = subIdx.filter(i => RAW.sc[i] === "Long (9+h)");
+    if (rec.length < 10 || lng.length < 10) return null;
+    return summarizeGroup(lng).mean - summarizeGroup(rec).mean;
+  };
+
+  if (sexVal === "ALL") {
+    const gM = computeGapForSex(mIdx);
+    const gF = computeGapForSex(fIdx);
+    if (gM !== null && gF !== null) {
+      const fmt = v => (v >= 0 ? "+" : "") + v.toFixed(1);
+      document.getElementById("kpi-gap").textContent = fmt(gM) + " / " + fmt(gF) + " kg";
+      document.getElementById("kpi-gap-sub").textContent = "9+h minus 7–8h (Male / Female)";
+    } else {
+      document.getElementById("kpi-gap").textContent = "Low n / N/A";
+      document.getElementById("kpi-gap-sub").textContent = "Requires n >= 10 in both 7–8h & 9+h";
+    }
+  } else {
+    const g = computeGapForSex(idx);
+    if (g !== null) {
+      document.getElementById("kpi-gap").textContent = (g >= 0 ? "+" : "") + g.toFixed(1) + " kg";
+      document.getElementById("kpi-gap-sub").textContent = "9+h minus 7–8h (" + sexVal + ")";
+    } else {
+      document.getElementById("kpi-gap").textContent = "Low n / N/A";
+      document.getElementById("kpi-gap-sub").textContent = "Requires n >= 10 in both 7–8h & 9+h";
+    }
   }
 }
 
-function renderAgeTrajectories(idx) {
+function buildAgeTrajectoryTraces(subIdx, sexLabel, axisSuffix, showLeg) {
   const bins = ["≤4h", "5h", "6h", "7h", "8h", "9h", "10+h"];
   const ageGroups = ["16-29", "30-44", "45-59", "60-74", "75-80+"].filter(g => selectedAges.has(g));
+  const offsets = [-0.16, -0.08, 0, 0.08, 0.16];
   const traces = [];
 
-  ageGroups.forEach(ag => {
+  ageGroups.forEach((ag, aIdx) => {
     const bucket = {};
     bins.forEach(b => (bucket[b] = []));
 
-    for (let k = 0; k < idx.length; k++) {
-      const i = idx[k];
+    for (let k = 0; k < subIdx.length; k++) {
+      const i = subIdx[k];
       if (RAW.ag[i] !== ag) continue;
-      const b = sleepBinLabel(RAW.sh[i]);
-      bucket[b].push(RAW[activeMetric][i]);
+      bucket[sleepBinLabel(RAW.sh[i])].push(i);
     }
 
     const xs = [];
     const ys = [];
     const cis = [];
-    const ns = [];
+    const cdata = [];
 
-    bins.forEach(b => {
-      const arr = bucket[b];
-      if (arr.length >= 4) {
-        const m = mean(arr);
-        const ci = 1.96 * (sd(arr, m) / Math.sqrt(arr.length));
-        xs.push(b);
-        ys.push(Number(m.toFixed(1)));
-        cis.push(Number(ci.toFixed(1)));
-        ns.push(arr.length);
+    bins.forEach((b, bIdx) => {
+      const cellIdx = bucket[b];
+      if (cellIdx.length >= 10) {
+        const st = summarizeGroup(cellIdx);
+        xs.push(bIdx + offsets[aIdx % offsets.length]);
+        ys.push(Number(st.mean.toFixed(1)));
+        cis.push(Number(st.ci.toFixed(1)));
+        cdata.push([b, st.n]);
       }
     });
 
     traces.push({
       type: "scatter",
-      mode: "lines+markers",
+      mode: "markers",
       name: "Ages " + ag,
+      legendgroup: ag,
+      showlegend: showLeg,
+      xaxis: "x" + axisSuffix,
+      yaxis: "y" + axisSuffix,
       x: xs,
       y: ys,
-      customdata: ns,
+      customdata: cdata,
       error_y: {
         type: "data",
         array: cis,
         visible: true,
-        thickness: 1.4,
+        thickness: 1.8,
         width: 4,
         color: AGE_PALETTE[ag]
       },
-      line: { width: 2.8, color: AGE_PALETTE[ag] },
-      marker: { size: 8, color: AGE_PALETTE[ag], line: { color: "#050811", width: 1.5 } },
+      marker: {
+        size: 8.5,
+        color: AGE_PALETTE[ag],
+        line: { color: "#050811", width: 1.4 }
+      },
       hovertemplate:
-        "<b>Ages " + ag + " &middot; %{x} Sleep</b><br>" +
-        "Mean Strength: %{y} kg (&plusmn;%{error_y.array} kg 95% CI)<br>" +
-        "Participants: n = %{customdata}<extra></extra>"
+        "<b>" + sexLabel + " &middot; Ages " + ag + " &middot; %{customdata[0]} Sleep</b><br>" +
+        "Mean Strength: <b>%{y:.1f} kg</b> (&plusmn;%{error_y.array} kg 95% CI)<br>" +
+        "Cell Sample Size: n = %{customdata[1]}<extra></extra>"
     });
   });
 
-  const yTitle = activeMetric === "cg" ? "Combined Grip Strength (kg)" : "Max Single-Hand Grip (kg)";
-  const layout = {
-    paper_bgcolor: "rgba(0,0,0,0)",
-    plot_bgcolor: "rgba(8,13,26,0.7)",
-    margin: { t: 28, r: 24, b: 56, l: 68 },
-    font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
-    xaxis: {
-      title: { text: "Usual Nightly Sleep Duration", font: { size: 13, color: "#e2e8f0" } },
-      categoryorder: "array",
-      categoryarray: bins,
-      gridcolor: "rgba(148,163,184,0.10)"
-    },
-    yaxis: {
-      title: { text: yTitle, font: { size: 13, color: "#e2e8f0" } },
-      gridcolor: "rgba(148,163,184,0.10)"
-    },
-    legend: {
-      orientation: "h",
-      x: 0,
-      y: 1.11,
-      font: { color: "#e2e8f0", size: 12 }
-    }
-  };
+  return traces;
+}
 
-  Plotly.react("plot-age-trajectories", traces, layout, { responsive: true, displaylogo: false });
+function renderAgeTrajectories(idx) {
+  const bins = ["≤4h", "5h", "6h", "7h", "8h", "9h", "10+h"];
+  const sexVal = document.getElementById("sex-select")?.value || "ALL";
+  const yTitle = activeMetric === "cg" ? "Combined Grip Strength (kg)" : "Peak Single-Hand Grip (kg)";
+
+  if (sexVal === "ALL") {
+    const mIdx = idx.filter(i => RAW.s[i] === "Male");
+    const fIdx = idx.filter(i => RAW.s[i] === "Female");
+    const mTraces = buildAgeTrajectoryTraces(mIdx, "Male", "", true);
+    const fTraces = buildAgeTrajectoryTraces(fIdx, "Female", "2", false);
+
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 52, r: 22, b: 64, l: 66 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: {
+        domain: [0, 0.47],
+        range: [-0.55, 6.55],
+        tickvals: [0, 1, 2, 3, 4, 5, 6],
+        ticktext: bins,
+        title: { text: "Nightly Sleep Hours (Males, cells n >= 10)", font: { size: 12, color: "#cbd5e1" } },
+        gridcolor: "rgba(148,163,184,0.10)",
+        zeroline: false
+      },
+      yaxis: {
+        title: { text: yTitle, font: { size: 13, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.12)"
+      },
+      xaxis2: {
+        domain: [0.53, 1.0],
+        anchor: "y2",
+        range: [-0.55, 6.55],
+        tickvals: [0, 1, 2, 3, 4, 5, 6],
+        ticktext: bins,
+        title: { text: "Nightly Sleep Hours (Females, cells n >= 10)", font: { size: 12, color: "#cbd5e1" } },
+        gridcolor: "rgba(148,163,184,0.10)",
+        zeroline: false
+      },
+      yaxis2: {
+        anchor: "x2",
+        matches: "y",
+        tickfont: { color: "#94a3b8" },
+        gridcolor: "rgba(148,163,184,0.12)"
+      },
+      annotations: [
+        {
+          xref: "paper", yref: "paper", x: 0.235, y: 1.07,
+          xanchor: "center", yanchor: "bottom", showarrow: false,
+          text: "<b style='color:#7dd3fc;font-size:13px'>MALES (n = " + mIdx.length.toLocaleString() + ")</b>"
+        },
+        {
+          xref: "paper", yref: "paper", x: 0.765, y: 1.07,
+          xanchor: "center", yanchor: "bottom", showarrow: false,
+          text: "<b style='color:#f9a8d4;font-size:13px'>FEMALES (n = " + fIdx.length.toLocaleString() + ")</b>"
+        }
+      ],
+      legend: { orientation: "h", x: 0, y: -0.17, font: { color: "#e2e8f0", size: 12 } }
+    };
+
+    Plotly.react("plot-age-trajectories", mTraces.concat(fTraces), layout, {
+      responsive: true,
+      displaylogo: false
+    });
+  } else {
+    const traces = buildAgeTrajectoryTraces(idx, sexVal, "", true);
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 32, r: 24, b: 64, l: 68 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: {
+        range: [-0.55, 6.55],
+        tickvals: [0, 1, 2, 3, 4, 5, 6],
+        ticktext: bins,
+        title: { text: "Nightly Sleep Hours (" + sexVal + ", cells n >= 10)", font: { size: 12.5, color: "#cbd5e1" } },
+        gridcolor: "rgba(148,163,184,0.10)",
+        zeroline: false
+      },
+      yaxis: {
+        title: { text: yTitle, font: { size: 13, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.12)"
+      },
+      legend: { orientation: "h", x: 0, y: 1.11, font: { color: "#e2e8f0", size: 12 } }
+    };
+
+    Plotly.react("plot-age-trajectories", traces, layout, { responsive: true, displaylogo: false });
+  }
 }
 
 function renderSleepBoxes(idx) {
@@ -531,39 +498,52 @@ function renderSleepBoxes(idx) {
     "Long (9+h)"
   ].filter(c => selectedSleeps.has(c));
 
-  const traces = cats.map(cat => {
-    const vals = [];
-    for (let k = 0; k < idx.length; k++) {
-      const i = idx[k];
-      if (RAW.sc[i] === cat) vals.push(RAW[activeMetric][i]);
-    }
+  const sexVal = document.getElementById("sex-select")?.value || "ALL";
+  const sexes = sexVal === "ALL" ? ["Male", "Female"] : [sexVal];
+  const sexColors = { Male: "#38bdf8", Female: "#f472b6" };
+  const sexFills = { Male: "rgba(56, 189, 248, 0.20)", Female: "rgba(244, 114, 182, 0.20)" };
+
+  const traces = sexes.map(sx => {
+    const xs = [];
+    const ys = [];
+
+    cats.forEach(cat => {
+      const label = SLEEP_SHORT[cat];
+      for (let k = 0; k < idx.length; k++) {
+        const i = idx[k];
+        if (RAW.s[i] === sx && RAW.sc[i] === cat) {
+          xs.push(label);
+          ys.push(RAW[activeMetric][i]);
+        }
+      }
+    });
+
     return {
       type: "box",
-      name: cat
-        .replace(" (<=5h)", "\n(≤5h)")
-        .replace(" (6h)", "\n(6h)")
-        .replace(" (7-8h)", "\n(7–8h)")
-        .replace(" (9+h)", "\n(9+h)"),
-      y: vals,
+      name: sx + " (n = " + ys.length.toLocaleString() + ")",
+      x: xs,
+      y: ys,
       boxmean: true,
       boxpoints: false,
-      marker: { color: SLEEP_PALETTE[cat] },
-      line: { color: SLEEP_PALETTE[cat], width: 2 },
-      fillcolor: "rgba(34, 211, 238, 0.12)"
+      marker: { color: sexColors[sx] },
+      line: { color: sexColors[sx], width: 2 },
+      fillcolor: sexFills[sx]
     };
   });
 
-  const yTitle = activeMetric === "cg" ? "Combined Grip Strength (kg)" : "Max Single-Hand Grip (kg)";
+  const yTitle = activeMetric === "cg" ? "Combined Grip Strength (kg)" : "Peak Single-Hand Grip (kg)";
   const layout = {
+    boxmode: sexes.length > 1 ? "group" : "overlay",
     paper_bgcolor: "rgba(0,0,0,0)",
-    plot_bgcolor: "rgba(8,13,26,0.7)",
-    margin: { t: 18, r: 18, b: 58, l: 64 },
-    showlegend: false,
+    plot_bgcolor: "rgba(8,13,26,0.72)",
+    margin: { t: 28, r: 18, b: 58, l: 64 },
+    showlegend: true,
+    legend: { orientation: "h", x: 0, y: 1.13, font: { size: 11.5, color: "#e2e8f0" } },
     font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
-    xaxis: { gridcolor: "rgba(148,163,184,0.08)" },
+    xaxis: { tickfont: { size: 11.5, color: "#f8fafc" }, gridcolor: "rgba(148,163,184,0.08)" },
     yaxis: {
-      title: { text: yTitle, font: { size: 12.5, color: "#e2e8f0" } },
-      gridcolor: "rgba(148,163,184,0.10)"
+      title: { text: yTitle, font: { size: 12.5, color: "#f8fafc" } },
+      gridcolor: "rgba(148,163,184,0.12)"
     }
   };
 
@@ -571,21 +551,12 @@ function renderSleepBoxes(idx) {
 }
 
 function renderRightPanel(idx) {
-  const yTitle = activeMetric === "cg" ? "Combined Grip Strength (kg)" : "Max Single-Hand Grip (kg)";
+  const yTitle = activeMetric === "cg" ? "Combined Grip Strength (kg)" : "Peak Single-Hand Grip (kg)";
+  const sexVal = document.getElementById("sex-select")?.value || "ALL";
+  const sexes = sexVal === "ALL" ? ["Male", "Female"] : [sexVal];
 
   if (rightPanelMode === "lifespan") {
-    const ageBins = [
-      { label: "16–22", min: 16, max: 22 },
-      { label: "23–29", min: 23, max: 29 },
-      { label: "30–37", min: 30, max: 37 },
-      { label: "38–45", min: 38, max: 45 },
-      { label: "46–53", min: 46, max: 53 },
-      { label: "54–61", min: 54, max: 61 },
-      { label: "62–69", min: 62, max: 69 },
-      { label: "70–76", min: 70, max: 76 },
-      { label: "77–80+", min: 77, max: 85 }
-    ];
-
+    const stages = ["16-29", "30-44", "45-59", "60-74", "75-80+"].filter(g => selectedAges.has(g));
     const cats = [
       "Very Short (<=5h)",
       "Short (6h)",
@@ -593,69 +564,100 @@ function renderRightPanel(idx) {
       "Long (9+h)"
     ].filter(c => selectedSleeps.has(c));
 
-    const traces = cats.map(cat => {
-      const xs = [];
-      const ys = [];
-      const ns = [];
+    const catPalette = {
+      "Very Short (<=5h)": "#38bdf8",
+      "Short (6h)": "#2dd4bf",
+      "Recommended (7-8h)": "#f8fafc",
+      "Long (9+h)": "#a78bfa"
+    };
+    const offsets = [-0.15, -0.05, 0.05, 0.15];
+    const traces = [];
 
-      ageBins.forEach(ab => {
-        const arr = [];
-        for (let k = 0; k < idx.length; k++) {
-          const i = idx[k];
-          if (RAW.sc[i] === cat && RAW.a[i] >= ab.min && RAW.a[i] <= ab.max) {
-            arr.push(RAW[activeMetric][i]);
+    sexes.forEach(sx => {
+      cats.forEach((cat, cIdx) => {
+        const xs = [];
+        const ys = [];
+        const cis = [];
+        const cdata = [];
+
+        stages.forEach((stName, sIdx) => {
+          const cellIdx = [];
+          for (let k = 0; k < idx.length; k++) {
+            const i = idx[k];
+            if (RAW.s[i] === sx && RAW.sc[i] === cat && RAW.ag[i] === stName) {
+              cellIdx.push(i);
+            }
           }
-        }
-        if (arr.length >= 5) {
-          xs.push(ab.label);
-          ys.push(Number(mean(arr).toFixed(1)));
-          ns.push(arr.length);
+          if (cellIdx.length >= 10) {
+            const st = summarizeGroup(cellIdx);
+            xs.push(sIdx + offsets[cIdx % offsets.length]);
+            ys.push(Number(st.mean.toFixed(1)));
+            cis.push(Number(st.ci.toFixed(1)));
+            cdata.push([stName, st.n]);
+          }
+        });
+
+        if (xs.length > 0) {
+          traces.push({
+            type: "scatter",
+            mode: "markers",
+            name: (sexes.length > 1 ? sx[0] + " · " : "") + SLEEP_SHORT[cat],
+            x: xs,
+            y: ys,
+            customdata: cdata,
+            marker: {
+              size: 8.5,
+              symbol: sx === "Male" ? "circle" : "diamond",
+              color: catPalette[cat],
+              line: { color: sx === "Male" ? "#38bdf8" : "#f472b6", width: 1.8 }
+            },
+            error_y: {
+              type: "data",
+              array: cis,
+              visible: true,
+              color: catPalette[cat],
+              thickness: 1.7,
+              width: 4
+            },
+            hovertemplate:
+              "<b>" + sx + " &middot; " + SLEEP_SHORT[cat] + " (Ages %{customdata[0]})</b><br>" +
+              "Mean: <b>%{y:.1f} kg</b> (&plusmn;%{error_y.array} kg 95% CI)<br>" +
+              "Cell Count: n = %{customdata[1]}<extra></extra>"
+          });
         }
       });
-
-      return {
-        type: "scatter",
-        mode: "lines+markers",
-        name: cat,
-        x: xs,
-        y: ys,
-        customdata: ns,
-        line: { width: 2.6, shape: "spline", color: SLEEP_PALETTE[cat] },
-        marker: { size: 7, color: SLEEP_PALETTE[cat] },
-        hovertemplate:
-          "<b>" + cat + "</b> (Ages %{x})<br>" +
-          "Mean: %{y} kg (n = %{customdata})<extra></extra>"
-      };
     });
 
     const layout = {
       paper_bgcolor: "rgba(0,0,0,0)",
-      plot_bgcolor: "rgba(8,13,26,0.7)",
-      margin: { t: 28, r: 18, b: 58, l: 64 },
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 36, r: 18, b: 58, l: 64 },
       font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
       xaxis: {
-        title: { text: "Participant Age (Years, 16 to 80+)", font: { size: 12, color: "#e2e8f0" } },
-        gridcolor: "rgba(148,163,184,0.10)"
+        tickvals: stages.map((_, i) => i),
+        ticktext: stages.map(s => "Ages " + s),
+        title: { text: "Lifespan Age Group (Discrete Means ± 95% CI, n >= 10)", font: { size: 12, color: "#cbd5e1" } },
+        gridcolor: "rgba(148,163,184,0.10)",
+        zeroline: false
       },
       yaxis: {
-        title: { text: yTitle, font: { size: 12.5, color: "#e2e8f0" } },
-        gridcolor: "rgba(148,163,184,0.10)"
+        title: { text: yTitle, font: { size: 12.5, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.12)"
       },
-      legend: { orientation: "h", x: 0, y: 1.15, font: { size: 10.5, color: "#e2e8f0" } }
+      legend: { orientation: "h", x: 0, y: 1.18, font: { size: 10.2, color: "#e2e8f0" } }
     };
 
     Plotly.react("plot-right-panel", traces, layout, { responsive: true, displaylogo: false });
   } else {
     const groups = [
       "Non-Hispanic Black",
+      "Other / Multi-Racial",
       "Non-Hispanic White",
       "Mexican American",
-      "Other / Multi-Racial",
       "Other Hispanic",
       "Non-Hispanic Asian"
     ];
-    const sexes = ["Male", "Female"];
-    const sexColors = { Male: "#38bdf8", Female: "#2dd4bf" };
+    const sexColors = { Male: "#38bdf8", Female: "#f472b6" };
 
     const traces = sexes.map(sx => {
       const xs = [];
@@ -664,18 +666,17 @@ function renderRightPanel(idx) {
       const ns = [];
 
       groups.forEach(g => {
-        const arr = [];
+        const cellIdx = [];
         for (let k = 0; k < idx.length; k++) {
           const i = idx[k];
-          if (RAW.s[i] === sx && RAW.r[i] === g) arr.push(RAW[activeMetric][i]);
+          if (RAW.s[i] === sx && RAW.r[i] === g) cellIdx.push(i);
         }
-        if (arr.length >= 4) {
-          const m = mean(arr);
-          const ci = 1.96 * (sd(arr, m) / Math.sqrt(arr.length));
+        if (cellIdx.length >= 10) {
+          const st = summarizeGroup(cellIdx);
           xs.push(g.replace("Non-Hispanic ", "NH "));
-          ys.push(Number(m.toFixed(1)));
-          cis.push(Number(ci.toFixed(1)));
-          ns.push(arr.length);
+          ys.push(Number(st.mean.toFixed(1)));
+          cis.push(Number(st.ci.toFixed(1)));
+          ns.push(st.n);
         }
       });
 
@@ -686,21 +687,21 @@ function renderRightPanel(idx) {
         y: ys,
         customdata: ns,
         marker: { color: sexColors[sx], opacity: 0.88 },
-        error_y: { type: "data", array: cis, visible: true, color: "#e2e8f0", thickness: 1.2 },
-        hovertemplate: "<b>%{x} (" + sx + ")</b><br>Mean: %{y} kg (n = %{customdata})<extra></extra>"
+        error_y: { type: "data", array: cis, visible: true, color: "#f8fafc", thickness: 1.4, width: 4 },
+        hovertemplate: "<b>%{x} (" + sx + ")</b><br>Mean: <b>%{y:.1f} kg</b> (&plusmn;%{error_y.array} kg 95% CI)<br>n = %{customdata}<extra></extra>"
       };
     });
 
     const layout = {
       barmode: "group",
       paper_bgcolor: "rgba(0,0,0,0)",
-      plot_bgcolor: "rgba(8,13,26,0.7)",
-      margin: { t: 28, r: 18, b: 78, l: 64 },
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 28, r: 18, b: 74, l: 64 },
       font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
-      xaxis: { tickangle: -22, gridcolor: "rgba(148,163,184,0.08)" },
+      xaxis: { tickangle: -20, tickfont: { color: "#f8fafc" }, gridcolor: "rgba(148,163,184,0.08)" },
       yaxis: {
-        title: { text: yTitle, font: { size: 12.5, color: "#e2e8f0" } },
-        gridcolor: "rgba(148,163,184,0.10)"
+        title: { text: yTitle, font: { size: 12.5, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.12)"
       },
       legend: { orientation: "h", x: 0, y: 1.13, font: { size: 11.5, color: "#e2e8f0" } }
     };
@@ -710,18 +711,16 @@ function renderRightPanel(idx) {
 }
 
 function updateExplorer() {
-  const idx = getFilteredIndices();
-  updateKPIs(idx);
-  renderAgeTrajectories(idx);
-  renderSleepBoxes(idx);
-  renderRightPanel(idx);
+  if (typeof RAW === "undefined" || !document.getElementById("plot-age-trajectories")) return;
+  const res = getFilteredIndices();
+  updateKPIs(res.idx, res.excludedMissing);
+  renderAgeTrajectories(res.idx);
+  renderSleepBoxes(res.idx);
+  renderRightPanel(res.idx);
 }
 
-/* ---------- Boot ---------- */
 document.addEventListener("DOMContentLoaded", function () {
-  renderHeroSurface();
-  const hash = (window.location.hash || "").replace("#", "");
-  if (["overview", "explorer", "story"].includes(hash)) {
-    switchView(hash);
+  if (document.getElementById("plot-age-trajectories")) {
+    updateExplorer();
   }
 });

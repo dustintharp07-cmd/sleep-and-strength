@@ -1,0 +1,15 @@
+Type: Project
+Package: sleepandstrength
+Title: Sleep Duration and Physical Strength Across the Lifespan (CDC NHANES 2011-2014)
+Version: 0.2.0
+Description: Reproducible Quarto website investigating relationships between nightly sleep duration and objective isometric grip strength across ages 16-80+ using CDC NHANES 2011-2014 data and complex multistage survey design.
+Imports:
+    broom,
+    haven,
+    jsonlite,
+    knitr,
+    plotly,
+    scales,
+    splines,
+    survey (>= 4.2),
+    tidyverse

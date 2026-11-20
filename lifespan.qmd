@@ -1,0 +1,816 @@
+---
+title: "Sex & Lifespan — Sleep & Physical Strength"
+---
+
+```{r}
+library(tidyverse)
+library(haven)
+library(survey)
+library(splines)
+library(broom)
+library(plotly)
+library(jsonlite)
+library(scales)
+
+fmt1 <- \(x) sprintf("%.1f", x)
+
+# 1. Load preserved 10,987-participant dataset + construct verified NHANES MEC design
+df <- read_rds("data/processed/nhanes_sleep_strength.rds") |>
+  mutate(
+    age_band_14 = cut(
+      age,
+      breaks = c(15, 19, 24, 29, 34, 39, 44, 49, 54, 59, 64, 69, 74, 79, 85),
+      labels = c(
+        "16–19", "20–24", "25–29", "30–34", "35–39", "40–44", "45–49",
+        "50–54", "55–59", "60–64", "65–69", "70–74", "75–79", "80+"
+      )
+    )
+  )
+
+demo_mec <- bind_rows(
+  read_xpt("data/raw/DEMO_G.XPT") |> select(SEQN, SDMVPSU, SDMVSTRA, WTMEC2YR),
+  read_xpt("data/raw/DEMO_H.XPT") |> select(SEQN, SDMVPSU, SDMVSTRA, WTMEC2YR)
+) |>
+  filter(WTMEC2YR > 0) |>
+  mutate(mec_weight_4yr = WTMEC2YR / 2) |>
+  left_join(df |> select(-mec_weight_4yr) |> mutate(in_cohort = TRUE), by = "SEQN") |>
+  mutate(in_cohort = coalesce(in_cohort, FALSE))
+
+des_mec_full <- svydesign(
+  id = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~mec_weight_4yr,
+  nest = TRUE, data = demo_mec
+)
+des_analytic <- subset(des_mec_full, in_cohort)
+
+n_total <- nrow(df)
+n_male <- sum(df$sex == "Male")
+n_female <- sum(df$sex == "Female")
+n_75plus <- sum(df$age_group == "75-80+")
+n_75_79 <- sum(df$age >= 75 & df$age <= 79)
+n_topcoded80 <- sum(df$age == 80)
+n_top80_m <- sum(df$age == 80 & df$sex == "Male")
+n_top80_f <- sum(df$age == 80 & df$sex == "Female")
+
+# 2. Lifespan summary metrics (Peak 30-44 vs Older 75-80+ in Survey-Weighted Design)
+svy_stage_sex <- svyby(
+  ~combined_grip_kg, ~sex + age_group,
+  design = des_analytic, FUN = svymean, vartype = "ci"
+) |>
+  as_tibble()
+
+peak_m <- svy_stage_sex |> filter(sex == "Male", age_group == "30-44") |> pull(combined_grip_kg)
+old_m  <- svy_stage_sex |> filter(sex == "Male", age_group == "75-80+") |> pull(combined_grip_kg)
+drop_m_pct <- round((1 - old_m / peak_m) * 100, 1)
+
+peak_f <- svy_stage_sex |> filter(sex == "Female", age_group == "30-44") |> pull(combined_grip_kg)
+old_f  <- svy_stage_sex |> filter(sex == "Female", age_group == "75-80+") |> pull(combined_grip_kg)
+drop_f_pct <- round((1 - old_f / peak_f) * 100, 1)
+
+# 3. Discrete 14-bin lifespan profile + svyglm natural-spline curve (ages 16 to 80)
+band_midpoints <- c(17.5, 22, 27, 32, 37, 42, 47, 52, 57, 62, 67, 72, 77, 80)
+
+svy_14 <- svyby(
+  ~combined_grip_kg, ~sex + age_band_14,
+  design = des_analytic, FUN = svymean, vartype = "ci"
+) |>
+  as_tibble() |>
+  rename(w_mean = combined_grip_kg, w_lo = ci_l, w_hi = ci_u)
+
+unw_14 <- df |>
+  group_by(sex, age_band_14) |>
+  summarise(
+    n = n(),
+    u_mean = mean(combined_grip_kg),
+    u_se = sd(combined_grip_kg) / sqrt(n()),
+    u_lo = u_mean - qt(0.975, pmax(n() - 1L, 1L)) * u_se,
+    u_hi = u_mean + qt(0.975, pmax(n() - 1L, 1L)) * u_se,
+    .groups = "drop"
+  )
+
+lifespan_bins <- unw_14 |>
+  left_join(svy_14, by = c("sex", "age_band_14")) |>
+  mutate(
+    band_idx = match(as.character(age_band_14), levels(df$age_band_14)),
+    mid_age = band_midpoints[band_idx],
+    sex = as.character(sex),
+    age_band = as.character(age_band_14),
+    across(c(u_mean, u_lo, u_hi, w_mean, w_lo, w_hi), \(v) round(v, 1))
+  ) |>
+  select(sex, age_band, mid_age, n, u_mean, u_lo, u_hi, w_mean, w_lo, w_hi)
+
+# Smooth reference model on integer ages 16..80 via survey::svyglm
+m_life_svy <- svyglm(combined_grip_kg ~ sex * ns(age, df = 5), design = des_analytic)
+pred_grid <- expand_grid(
+  sex = factor(c("Male", "Female"), levels = c("Male", "Female")),
+  age = 16:80
+)
+mm_grid <- model.matrix(~ sex * ns(age, df = 5), data = pred_grid)
+beta_hat <- coef(m_life_svy)
+vcov_hat <- vcov(m_life_svy)
+fit_vals <- as.numeric(mm_grid %*% beta_hat)
+se_vals  <- sqrt(rowSums((mm_grid %*% vcov_hat) * mm_grid))
+t_crit   <- qt(0.975, df = degf(des_analytic) - length(beta_hat))
+
+lifespan_curve <- pred_grid |>
+  mutate(
+    sex = as.character(sex),
+    fit = round(fit_vals, 2),
+    lo = round(fit_vals - t_crit * se_vals, 2),
+    hi = round(fit_vals + t_crit * se_vals, 2)
+  )
+
+# 4. Upgraded Discrete Age Group x Sleep Category Matrix (Sex-Separated, Unsmoothed)
+svy_mat <- svyby(
+  ~combined_grip_kg, ~sex + age_group + sleep_category,
+  design = des_analytic, FUN = svymean, vartype = "ci"
+) |>
+  as_tibble() |>
+  rename(w_mean = combined_grip_kg, w_lo = ci_l, w_hi = ci_u)
+
+unw_mat <- df |>
+  group_by(sex, age_group, sleep_category) |>
+  summarise(
+    n = n(),
+    u_mean = mean(combined_grip_kg),
+    u_se = sd(combined_grip_kg) / sqrt(n()),
+    u_lo = u_mean - qt(0.975, pmax(n() - 1L, 1L)) * u_se,
+    u_hi = u_mean + qt(0.975, pmax(n() - 1L, 1L)) * u_se,
+    u_med = median(combined_grip_kg),
+    .groups = "drop"
+  )
+
+matrix_cells <- unw_mat |>
+  left_join(svy_mat, by = c("sex", "age_group", "sleep_category")) |>
+  mutate(
+    sex = as.character(sex),
+    age_group = as.character(age_group),
+    sleep_category = as.character(sleep_category),
+    across(c(u_mean, u_lo, u_hi, u_med, w_mean, w_lo, w_hi), \(v) round(v, 1))
+  )
+
+# 5. Demographic Subgroup Analysis (RIDRETH3 x Sex: Unweighted vs Survey-Weighted)
+svy_demo <- svyby(
+  ~combined_grip_kg, ~sex + race_ethnicity,
+  design = des_analytic, FUN = svymean, vartype = "ci"
+) |>
+  as_tibble() |>
+  rename(w_mean = combined_grip_kg, w_lo = ci_l, w_hi = ci_u)
+
+unw_demo <- df |>
+  group_by(sex, race_ethnicity) |>
+  summarise(
+    n = n(),
+    u_mean = mean(combined_grip_kg),
+    u_se = sd(combined_grip_kg) / sqrt(n()),
+    u_lo = u_mean - qt(0.975, pmax(n() - 1L, 1L)) * u_se,
+    u_hi = u_mean + qt(0.975, pmax(n() - 1L, 1L)) * u_se,
+    .groups = "drop"
+  )
+
+demo_cells <- unw_demo |>
+  left_join(svy_demo, by = c("sex", "race_ethnicity")) |>
+  mutate(
+    sex = as.character(sex),
+    across(c(u_mean, u_lo, u_hi, w_mean, w_lo, w_hi), \(v) round(v, 1))
+  )
+
+# Demographic sampling weights & short-sleep table
+w_tot <- sum(df$mec_weight_4yr)
+demo_sampling_tab <- df |>
+  group_by(race_ethnicity) |>
+  summarise(
+    n = n(),
+    unw_pct = round(n() / nrow(df) * 100, 1),
+    wtd_pct = round(sum(mec_weight_4yr) / w_tot * 100, 1),
+    short_sleep_pct = round(weighted.mean(sleep_hours <= 6, mec_weight_4yr) * 100, 1),
+    .groups = "drop"
+  ) |>
+  arrange(desc(wtd_pct))
+
+nhb_short <- demo_sampling_tab |> filter(race_ethnicity == "Non-Hispanic Black") |> pull(short_sleep_pct)
+nhw_short <- demo_sampling_tab |> filter(race_ethnicity == "Non-Hispanic White") |> pull(short_sleep_pct)
+nhb_unw_share <- demo_sampling_tab |> filter(race_ethnicity == "Non-Hispanic Black") |> pull(unw_pct)
+nhb_wtd_share <- demo_sampling_tab |> filter(race_ethnicity == "Non-Hispanic Black") |> pull(wtd_pct)
+
+# Explicit regression comparison with vs without RIDRETH3 to verify covariate adjustment directly
+df_ref <- df |> mutate(sleep_cat_ref = relevel(sleep_category, ref = "Recommended (7-8h)"))
+m_unw_norace <- lm(combined_grip_kg ~ sleep_cat_ref + sex * ns(age, df = 5), data = df_ref)
+m_unw_race   <- lm(combined_grip_kg ~ sleep_cat_ref + race_ethnicity + sex * ns(age, df = 5), data = df_ref)
+m_svy_check  <- svyglm(
+  combined_grip_kg ~ relevel(sleep_category, ref = "Recommended (7-8h)") + sex * ns(age, df = 5),
+  design = des_analytic
+)
+
+est_5h_norace <- round(coef(m_unw_norace)[["sleep_cat_refVery Short (<=5h)"]], 2)
+est_5h_race   <- round(coef(m_unw_race)[["sleep_cat_refVery Short (<=5h)"]], 2)
+pval_5h_race  <- round(summary(m_unw_race)$coefficients["sleep_cat_refVery Short (<=5h)", 4], 2)
+svy_5h_td     <- tidy(m_svy_check) |> filter(str_detect(term, "Very Short"))
+est_5h_svy    <- round(svy_5h_td$estimate, 2)
+pval_5h_svy   <- round(svy_5h_td$p.value, 2)
+min_cell_n    <- min(matrix_cells$n)
+
+life_payload <- toJSON(
+  list(
+    bins = lifespan_bins,
+    curve = lifespan_curve,
+    matrix = matrix_cells,
+    demo = demo_cells
+  ),
+  dataframe = "columns",
+  auto_unbox = TRUE
+)
+
+dep_widget <- plot_ly() |>
+  config(displayModeBar = FALSE) |>
+  htmlwidgets::onRender("function(el) { el.style.display = 'none'; }")
+```
+
+```{r}
+dep_widget
+```
+
+<div class="platform-shell">
+
+<!-- CHAPTER HEADER -->
+<section class="hero-section" style="padding: 2.15rem 2.3rem;">
+<div class="eyebrow-badge">
+Chapter 2 &middot; Structural Determinants &middot; Ages 16 to 80+ (N = `r comma(n_total)`)
+</div>
+<h1 class="hero-title" style="font-size: clamp(1.85rem, 3.4vw, 2.75rem);">
+Biological Sex &amp; the <span class="gradient-text">Lifespan Strength Arc</span>
+</h1>
+<p class="hero-subtitle" style="margin-bottom: 1.1rem;">
+Normative life-course studies establish that human grip strength rises through adolescence, peaks in early-to-mid adulthood, and declines steadily in later life, with substantial separation between men and women (<a href="about.html#references" style="color: #38bdf8; text-decoration: none;">Dodds et al., 2014</a>). Reproducing this trajectory in our `r comma(n_total)` NHANES examinees (`ages 16–80+`) demonstrates why sex dimorphism and nonlinear aging must be modeled before interpreting any sleep association.
+</p>
+
+<div class="rq-callout">
+<div class="rq-label">Chapter 2 Analytical Takeaway</div>
+<p class="rq-question">
+Combined grip strength peaks in ages `30–44` (`r fmt1(peak_m)` kg Male, `r fmt1(peak_f)` kg Female survey-weighted means) before declining `r fmt1(drop_m_pct)`% in men and `r fmt1(drop_f_pct)`% in women by ages `75–80+`—an age swing over ten times larger than typical sleep-tier differences.
+</p>
+</div>
+</section>
+
+<!-- KPI STRIP -->
+<section class="kpi-grid">
+<div class="kpi-card">
+<div class="kpi-label">Prime-Adulthood Peak (30–44)</div>
+<div class="kpi-value accent-cyan">`r fmt1(peak_m)` / `r fmt1(peak_f)` kg</div>
+<div class="kpi-sub">Survey-weighted Male / Female mean combined grip</div>
+</div>
+<div class="kpi-card">
+<div class="kpi-label">Older-Adult Mean (75–80+)</div>
+<div class="kpi-value accent-teal">`r fmt1(old_m)` / `r fmt1(old_f)` kg</div>
+<div class="kpi-sub">Survey-weighted Male / Female mean (`n = `r comma(n_75plus)`` in band)</div>
+</div>
+<div class="kpi-card">
+<div class="kpi-label">Peak-to-Late-Life Decline</div>
+<div class="kpi-value accent-violet">&minus;`r fmt1(drop_m_pct)`% / &minus;`r fmt1(drop_f_pct)`%</div>
+<div class="kpi-sub">Relative loss from ages 30–44 to 75–80+ (Male / Female)</div>
+</div>
+<div class="kpi-card">
+<div class="kpi-label">Top-Coded at `RIDAGEYR = 80`</div>
+<div class="kpi-value accent-blue">`r comma(n_topcoded80)`</div>
+<div class="kpi-sub">`r n_top80_m`M &middot; `r n_top80_f`F aged 80+ (plus `r n_75_79` aged 75–79 = `r comma(n_75plus)` in 75–80+)</div>
+</div>
+</section>
+
+<!-- FIGURE 2.1: NONLINEAR LIFESPAN STRENGTH TRAJECTORY -->
+<section class="glass-card">
+<div class="method-badge-row">
+<span class="method-badge badge-weighted" id="life-curve-badge">
+NHANES Survey-Weighted 5-Year Band Means + Spline Ribbon (95% CI)
+</span>
+<span class="method-badge badge-sample">
+Complete Cohort: N = `r comma(n_total)` (`r comma(n_male)` Males &middot; `r comma(n_female)` Females, 0 Missing)
+</span>
+</div>
+
+<div class="section-header" style="margin-bottom: 0.85rem;">
+<div style="max-width: 880px;">
+<h2 class="section-title">
+Upper-Body Strength Rises Steeply Through Late Adolescence, Peaks at Ages 30–44, and Declines by Roughly One-Third by Ages 75–80+
+</h2>
+<p class="section-desc">
+Discrete 5-year age-band means (&plusmn;95% CI, exact `n` in hover) overlaid on complex-survey `svyglm` natural cubic spline trajectories (`sex * ns(age, df = 5)`). Note that the rightmost marker (`80+`, `n = `r comma(n_topcoded80)``) aggregates all adults aged 80 and older due to NHANES public-use privacy top-coding.
+</p>
+</div>
+<div class="control-bar">
+<button class="pill-btn active" id="life-est-w" onclick="setLifeCurveMode('w')">Survey-Weighted + Spline</button>
+<button class="pill-btn" id="life-est-u" onclick="setLifeCurveMode('u')">Unweighted Sample Means</button>
+</div>
+</div>
+
+<div id="plot-lifespan-curve" style="width: 100%; height: 470px;"></div>
+
+<div class="finding-note">
+<strong>Why linear age adjustment fails:</strong> Because male combined grip rises from `~83 kg` at ages `16–19` to `~98 kg` at `30–34` before falling to `~64 kg` at `80+`, fitting a straight line for age misrepresents both adolescents/young adults and older adults. Both ends of that nonlinear curve (`16–19` and `75–80+`) also contain higher proportions of `9+h` sleepers—which is why flexible nonlinear age modeling (`ns(age, df = 5)`) was used in Chapter 1.
+</div>
+</section>
+
+<!-- FIGURE 2.2: SEX-SEPARATED DISCRETE AGE x SLEEP MATRICES (CONSOLIDATED & UPGRADED) -->
+<section class="glass-card">
+<div class="method-badge-row">
+<span class="method-badge badge-weighted" id="life-mat-badge">
+NHANES Survey-Weighted Cell Means (Unsmoothed Discrete Grid)
+</span>
+<span class="method-badge badge-sample">
+All 40 Sex &times; Age &times; Sleep Cells Populated (Smallest Cell n = `r min_cell_n`)
+</span>
+</div>
+
+<div class="section-header" style="margin-bottom: 0.85rem;">
+<div style="max-width: 880px;">
+<h2 class="section-title">
+Across Every Life Stage, Within-Age Strength Differences Across Sleep Tiers Are Small Compared With the Vertical Gradient of Aging
+</h2>
+<p class="section-desc">
+Upgraded from the initial rough-draft surface: Male and Female cohorts are separated onto sex-calibrated color scales with smoothing disabled (`zsmooth: false`), displaying exact cell means and subgroup sample sizes (`n`) directly inside every tile.
+</p>
+</div>
+<div class="control-bar">
+<button class="pill-btn active" id="mat-est-w" onclick="setLifeMatrixMode('w')">Survey-Weighted Means</button>
+<button class="pill-btn" id="mat-est-u" onclick="setLifeMatrixMode('u')">Unweighted Sample Means</button>
+</div>
+</div>
+
+<div id="plot-lifespan-matrix" style="width: 100%; height: 490px;"></div>
+</section>
+
+<!-- FIGURE 2.3: DEMOGRAPHIC SUBGROUPS & SURVEY WEIGHTING RATIONALE -->
+<section class="glass-card">
+<div class="method-badge-row">
+<span class="method-badge badge-weighted" id="demo-mode-badge">
+NHANES Survey-Weighted Subgroup Means (95% CI)
+</span>
+<span class="method-badge badge-sample">
+RIDRETH3 Complete: N = `r comma(n_total)` (0 Missing)
+</span>
+</div>
+
+<div class="section-header" style="margin-bottom: 0.85rem;">
+<div style="max-width: 880px;">
+<h2 class="section-title">
+Observed Grip Strength and Short-Sleep Prevalence Vary Across NHANES Race/Hispanic Origin Groups Within Each Sex
+</h2>
+<p class="section-desc">
+Descriptive subgroup means (&plusmn;95% CI) across NHANES `RIDRETH3` categories separated by sex, paired with unweighted sample shares vs. MEC-weighted U.S. population shares below.
+</p>
+</div>
+<div class="control-bar">
+<button class="pill-btn active" id="demo-est-w" onclick="setDemoMode('w')">Survey-Weighted</button>
+<button class="pill-btn" id="demo-est-u" onclick="setDemoMode('u')">Unweighted Sample</button>
+</div>
+</div>
+
+<div id="plot-demo-bars" style="width: 100%; height: 420px;"></div>
+
+<div style="margin-top: 1.2rem; overflow-x: auto;">
+<table class="dark-table">
+<thead>
+<tr>
+<th>NHANES Race / Hispanic Origin (`RIDRETH3`)</th>
+<th style="text-align: right;">Sample Count (n)</th>
+<th style="text-align: right;">Unweighted Sample Share</th>
+<th style="text-align: right;">MEC-Weighted U.S. Share</th>
+<th style="text-align: right;">Weighted &le;6h Sleep Prevalence</th>
+</tr>
+</thead>
+<tbody>
+```{r}
+#| results: asis
+for (i in seq_len(nrow(demo_sampling_tab))) {
+  r <- demo_sampling_tab[i, ]
+  cat(paste0(
+    "<tr>",
+    "<td><strong>", r$race_ethnicity, "</strong></td>",
+    "<td style='text-align:right;font-variant-numeric:tabular-nums;'>", comma(r$n), "</td>",
+    "<td style='text-align:right;font-variant-numeric:tabular-nums;'>", fmt1(r$unw_pct), "%</td>",
+    "<td style='text-align:right;font-variant-numeric:tabular-nums;'>", fmt1(r$wtd_pct), "%</td>",
+    "<td style='text-align:right;font-variant-numeric:tabular-nums;'>", fmt1(r$short_sleep_pct), "%</td>",
+    "</tr>\n"
+  ))
+}
+```
+</tbody>
+</table>
+</div>
+
+<div class="finding-note">
+<strong>Distinguishing descriptive subgroup differences from covariate adjustment and survey weighting:</strong> The chart and table above document descriptive differences across NHANES `RIDRETH3` categories—for example, Non-Hispanic Black examinees represent `r fmt1(nhb_unw_share)`% of the unweighted sample (oversampled relative to their `r fmt1(nhb_wtd_share)`% MEC-weighted U.S. population share; <a href="about.html#references" style="color: #38bdf8; text-decoration: none;">CDC/NCHS Analytic Guidelines, 2018</a>) and exhibit both higher mean grip strength and higher weighted `&le;6h` sleep prevalence (`r fmt1(nhb_short)`% vs. `r fmt1(nhw_short)`% in Non-Hispanic White examinees). Descriptive differences alone do not prove statistical confounding, so we verified this directly via regression comparison: in unweighted `sex * ns(age, df = 5)` OLS, adding `RIDRETH3` shifts the `&le;5h` vs. `7–8h` coefficient from `r sprintf("%+.2f", est_5h_norace)` kg to `r sprintf("%+.2f", est_5h_race)` kg (`p = `r sprintf("%.2f", pval_5h_race)``). Applying MEC survey weights (`WTMEC2YR / 2`) separately recalibrates the sample to target U.S. population proportions (`r sprintf("%+.2f", est_5h_svy)` kg, `p = `r sprintf("%.2f", pval_5h_svy)`` in Chapter 1's Model 4), without implying any biological or causal mechanism behind subgroup differences.
+</div>
+</section>
+
+<!-- CHAPTER NAVIGATION -->
+<section class="info-grid-2">
+<a class="nav-portal-card" href="recovery.html">
+<div class="section-kicker">Previous Chapter</div>
+<h3 style="font-size: 1.18rem; font-weight: 700; color: #f8fafc; margin: 0.2rem 0 0.35rem 0;">
+&larr; Chapter 1: Athletic Recovery &amp; Model Adjustment
+</h3>
+<p style="font-size: 0.89rem; color: #cbd5e1; margin: 0;">
+Review ages 16–44 dose–response profiles and four-model attenuation.
+</p>
+</a>
+
+<a class="nav-portal-card" href="aging-sleep.html">
+<div class="section-kicker">Next Chapter</div>
+<h3 style="font-size: 1.18rem; font-weight: 700; color: #f8fafc; margin: 0.2rem 0 0.35rem 0;">
+Chapter 3: Lifelong Functioning, 9+h Sleep &amp; Sleep Quality &rarr;
+</h3>
+<p style="font-size: 0.89rem; color: #cbd5e1; margin: 0;">
+Test life-stage interactions, self-reported sleep trouble (`SLQ050`), diagnosed disorders (`SLQ060`), and household income (`INDFMPIR`).
+</p>
+</a>
+</section>
+
+</div>
+
+```{r}
+#| results: asis
+cat(paste0("<script>const LIFE_DATA = ", life_payload, ";</script>\n"))
+```
+
+```{=html}
+<script>
+(function () {
+  let curveMode = "w";
+  let matMode = "w";
+  let demoMode = "w";
+
+  function renderLifespanCurve() {
+    const B = LIFE_DATA.bins;
+    const C = LIFE_DATA.curve;
+    const traces = [];
+
+    const badge = document.getElementById("life-curve-badge");
+    if (curveMode === "w") {
+      badge.className = "method-badge badge-weighted";
+      badge.textContent = "NHANES Survey-Weighted 5-Year Band Means + Spline Ribbon (95% CI)";
+    } else {
+      badge.className = "method-badge badge-descriptive";
+      badge.textContent = "Unweighted 5-Year Band Sample Means (95% CI)";
+    }
+
+    const sexConfigs = [
+      { sex: "Male", color: "#38bdf8", fill: "rgba(56, 189, 248, 0.16)" },
+      { sex: "Female", color: "#f472b6", fill: "rgba(244, 114, 182, 0.16)" }
+    ];
+
+    sexConfigs.forEach(cfg => {
+      if (curveMode === "w") {
+        const cIdx = [];
+        for (let i = 0; i < C.sex.length; i++) {
+          if (C.sex[i] === cfg.sex) cIdx.push(i);
+        }
+        traces.push({
+          type: "scatter",
+          mode: "lines",
+          x: cIdx.map(i => C.age[i]),
+          y: cIdx.map(i => C.hi[i]),
+          line: { width: 0 },
+          hoverinfo: "skip",
+          showlegend: false
+        });
+        traces.push({
+          type: "scatter",
+          mode: "lines",
+          name: cfg.sex + " Survey Spline (95% CI)",
+          x: cIdx.map(i => C.age[i]),
+          y: cIdx.map(i => C.lo[i]),
+          fill: "tonexty",
+          fillcolor: cfg.fill,
+          line: { width: 0 },
+          hoverinfo: "skip",
+          showlegend: false
+        });
+        traces.push({
+          type: "scatter",
+          mode: "lines",
+          name: cfg.sex + " Spline Fit (svyglm)",
+          x: cIdx.map(i => C.age[i]),
+          y: cIdx.map(i => C.fit[i]),
+          line: { color: cfg.color, width: 2.6 },
+          hovertemplate: "<b>" + cfg.sex + " Age %{x}</b><br>Spline Predicted Mean: %{y:.1f} kg<extra></extra>"
+        });
+      }
+
+      const bIdx = [];
+      for (let i = 0; i < B.sex.length; i++) {
+        if (B.sex[i] === cfg.sex) bIdx.push(i);
+      }
+
+      const ys = bIdx.map(i => (curveMode === "w" ? B.w_mean[i] : B.u_mean[i]));
+      const los = bIdx.map(i => (curveMode === "w" ? B.w_lo[i] : B.u_lo[i]));
+      const his = bIdx.map(i => (curveMode === "w" ? B.w_hi[i] : B.u_hi[i]));
+
+      traces.push({
+        type: "scatter",
+        mode: "markers",
+        name: cfg.sex + (curveMode === "w" ? " 5-Yr Weighted Mean" : " 5-Yr Sample Mean"),
+        x: bIdx.map(i => B.mid_age[i]),
+        y: ys,
+        customdata: bIdx.map((i, k) => [B.age_band[i], B.n[i], los[k].toFixed(1), his[k].toFixed(1)]),
+        marker: {
+          size: 9,
+          color: "#ffffff",
+          line: { color: cfg.color, width: 2.4 }
+        },
+        error_y: {
+          type: "data",
+          symmetric: false,
+          array: ys.map((m, k) => Number((his[k] - m).toFixed(2))),
+          arrayminus: ys.map((m, k) => Number((m - los[k]).toFixed(2))),
+          visible: true,
+          color: cfg.color,
+          thickness: 2,
+          width: 4
+        },
+        hovertemplate:
+          "<b>" + cfg.sex + " &middot; Ages %{customdata[0]}</b> (n = %{customdata[1]})<br>" +
+          "Mean Combined Grip: <b>%{y:.1f} kg</b> [95% CI: %{customdata[2]}–%{customdata[3]} kg]<extra></extra>"
+      });
+    });
+
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 28, r: 24, b: 62, l: 68 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: {
+        range: [14.5, 82.5],
+        tickvals: [17.5, 25, 35, 45, 55, 65, 75, 80],
+        ticktext: ["16–19", "25", "35", "45", "55", "65", "75", "80+ (Top-Coded)"],
+        title: { text: "Participant Age Across the Lifespan (Years)", font: { size: 13, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.10)"
+      },
+      yaxis: {
+        range: [30, 108],
+        title: { text: "Combined Bilateral Grip Strength (kg)", font: { size: 13, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.12)"
+      },
+      legend: { orientation: "h", x: 0, y: 1.11, font: { size: 11.5, color: "#e2e8f0" } }
+    };
+
+    Plotly.react("plot-lifespan-curve", traces, layout, { responsive: true, displaylogo: false });
+  }
+
+  function buildDiscreteMatrix(sexName, axisSuffix, cScale, zMin, zMax, cbarX) {
+    const M = LIFE_DATA.matrix;
+    const ageLevels = ["16-29", "30-44", "45-59", "60-74", "75-80+"];
+    const sleepLevels = [
+      "Very Short (<=5h)",
+      "Short (6h)",
+      "Recommended (7-8h)",
+      "Long (9+h)"
+    ];
+    const shortSleepLabels = ["≤5h Very Short", "6h Short", "7–8h Rec.", "9+h Long"];
+
+    const zMat = [];
+    const textMat = [];
+    const hoverMat = [];
+
+    ageLevels.forEach(ag => {
+      const zRow = [];
+      const tRow = [];
+      const hRow = [];
+      sleepLevels.forEach((sc, scIdx) => {
+        let idx = -1;
+        for (let i = 0; i < M.sex.length; i++) {
+          if (M.sex[i] === sexName && M.age_group[i] === ag && M.sleep_category[i] === sc) {
+            idx = i;
+            break;
+          }
+        }
+        if (idx >= 0) {
+          const val = matMode === "w" ? M.w_mean[idx] : M.u_mean[idx];
+          const lo = matMode === "w" ? M.w_lo[idx] : M.u_lo[idx];
+          const hi = matMode === "w" ? M.w_hi[idx] : M.u_hi[idx];
+          const n = M.n[idx];
+          zRow.push(val);
+          tRow.push("<b>" + val.toFixed(1) + " kg</b><br><span style='font-size:10.5px'>n=" + n + "</span>");
+          hRow.push(
+            "<b>" + sexName + " &middot; Ages " + ag + " &middot; " + shortSleepLabels[scIdx] + "</b><br>" +
+            (matMode === "w" ? "Survey-Weighted Mean: " : "Unweighted Sample Mean: ") +
+            "<b>" + val.toFixed(1) + " kg</b> [95% CI: " + lo.toFixed(1) + "–" + hi.toFixed(1) + " kg]<br>" +
+            "Sample Median: " + M.u_med[idx].toFixed(1) + " kg &middot; Cell Count: n = " + n
+          );
+        }
+      });
+      zMat.push(zRow);
+      textMat.push(tRow);
+      hoverMat.push(hRow);
+    });
+
+    return {
+      type: "heatmap",
+      xaxis: "x" + axisSuffix,
+      yaxis: "y" + axisSuffix,
+      x: shortSleepLabels,
+      y: ageLevels.map(a => "Ages " + a),
+      z: zMat,
+      text: textMat,
+      texttemplate: "%{text}",
+      textfont: { size: 11.5, color: "#f8fafc" },
+      customdata: hoverMat,
+      hovertemplate: "%{customdata}<extra></extra>",
+      zsmooth: false,
+      zmin: zMin,
+      zmax: zMax,
+      xgap: 3,
+      ygap: 3,
+      colorscale: cScale,
+      colorbar: {
+        title: { text: sexName + " (kg)", font: { size: 11, color: "#cbd5e1" } },
+        tickfont: { size: 10.5, color: "#94a3b8" },
+        len: 0.86,
+        thickness: 12,
+        x: cbarX,
+        outlinewidth: 0
+      }
+    };
+  }
+
+  function renderLifespanMatrix() {
+    const badge = document.getElementById("life-mat-badge");
+    if (matMode === "w") {
+      badge.className = "method-badge badge-weighted";
+      badge.textContent = "NHANES Survey-Weighted Cell Means (Unsmoothed Discrete Grid)";
+    } else {
+      badge.className = "method-badge badge-descriptive";
+      badge.textContent = "Unweighted Sample Cell Means (Unsmoothed Discrete Grid)";
+    }
+
+    const maleScale = [
+      [0.0, "#172554"],
+      [0.45, "#0369a1"],
+      [0.8, "#0284c7"],
+      [1.0, "#2dd4bf"]
+    ];
+    const femaleScale = [
+      [0.0, "#2e1065"],
+      [0.45, "#6d28d9"],
+      [0.8, "#be185d"],
+      [1.0, "#f472b6"]
+    ];
+
+    const mHeat = buildDiscreteMatrix("Male", "", maleScale, 58, 100, 0.455);
+    const fHeat = buildDiscreteMatrix("Female", "2", femaleScale, 35, 64, 1.01);
+
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 54, r: 58, b: 60, l: 88 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: {
+        domain: [0, 0.42],
+        title: { text: "Nightly Sleep Tier (Males)", font: { size: 12, color: "#cbd5e1" } }
+      },
+      yaxis: {
+        autorange: "reversed",
+        tickfont: { size: 12, color: "#f8fafc" }
+      },
+      xaxis2: {
+        domain: [0.56, 0.98],
+        anchor: "y2",
+        title: { text: "Nightly Sleep Tier (Females)", font: { size: 12, color: "#cbd5e1" } }
+      },
+      yaxis2: {
+        anchor: "x2",
+        autorange: "reversed",
+        tickfont: { size: 12, color: "#f8fafc" }
+      },
+      annotations: [
+        {
+          xref: "paper", yref: "paper", x: 0.21, y: 1.07,
+          xanchor: "center", yanchor: "bottom", showarrow: false,
+          text: "<b style='color:#7dd3fc;font-size:13.5px'>MALES (n = 5,420)</b> <span style='color:#94a3b8;font-size:11.5px'>Scale: 58–100 kg</span>"
+        },
+        {
+          xref: "paper", yref: "paper", x: 0.77, y: 1.07,
+          xanchor: "center", yanchor: "bottom", showarrow: false,
+          text: "<b style='color:#f9a8d4;font-size:13.5px'>FEMALES (n = 5,567)</b> <span style='color:#94a3b8;font-size:11.5px'>Scale: 35–64 kg</span>"
+        }
+      ]
+    };
+
+    Plotly.react("plot-lifespan-matrix", [mHeat, fHeat], layout, { responsive: true, displaylogo: false });
+  }
+
+  function renderDemoBars() {
+    const D = LIFE_DATA.demo;
+    const groups = [
+      "Non-Hispanic Black",
+      "Other / Multi-Racial",
+      "Non-Hispanic White",
+      "Mexican American",
+      "Other Hispanic",
+      "Non-Hispanic Asian"
+    ];
+    const badge = document.getElementById("demo-mode-badge");
+    if (demoMode === "w") {
+      badge.className = "method-badge badge-weighted";
+      badge.textContent = "NHANES Survey-Weighted Subgroup Means (95% CI)";
+    } else {
+      badge.className = "method-badge badge-descriptive";
+      badge.textContent = "Unweighted Sample Subgroup Means (95% CI)";
+    }
+
+    const sexConfigs = [
+      { sex: "Male", color: "#38bdf8" },
+      { sex: "Female", color: "#f472b6" }
+    ];
+
+    const traces = sexConfigs.map(cfg => {
+      const xs = [];
+      const ys = [];
+      const hiArr = [];
+      const loArr = [];
+      const cdata = [];
+
+      groups.forEach(g => {
+        for (let i = 0; i < D.sex.length; i++) {
+          if (D.sex[i] === cfg.sex && D.race_ethnicity[i] === g) {
+            const m = demoMode === "w" ? D.w_mean[i] : D.u_mean[i];
+            const lo = demoMode === "w" ? D.w_lo[i] : D.u_lo[i];
+            const hi = demoMode === "w" ? D.w_hi[i] : D.u_hi[i];
+            xs.push(g.replace("Non-Hispanic ", "NH "));
+            ys.push(m);
+            hiArr.push(Number((hi - m).toFixed(2)));
+            loArr.push(Number((m - lo).toFixed(2)));
+            cdata.push([g, D.n[i], lo.toFixed(1), hi.toFixed(1)]);
+          }
+        }
+      });
+
+      return {
+        type: "bar",
+        name: cfg.sex,
+        x: xs,
+        y: ys,
+        customdata: cdata,
+        marker: { color: cfg.color, opacity: 0.88 },
+        error_y: {
+          type: "data",
+          symmetric: false,
+          array: hiArr,
+          arrayminus: loArr,
+          visible: true,
+          color: "#f8fafc",
+          thickness: 1.6,
+          width: 4
+        },
+        hovertemplate:
+          "<b>%{customdata[0]} (" + cfg.sex + ")</b><br>" +
+          "Mean Grip: <b>%{y:.1f} kg</b> [95% CI: %{customdata[2]}–%{customdata[3]} kg]<br>" +
+          "Sample Count: n = %{customdata[1]}<extra></extra>"
+      };
+    });
+
+    const layout = {
+      barmode: "group",
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 28, r: 22, b: 68, l: 66 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: { tickfont: { size: 12, color: "#f8fafc" }, gridcolor: "rgba(148,163,184,0.08)" },
+      yaxis: {
+        range: [0, 105],
+        title: { text: "Combined Bilateral Grip Strength (kg)", font: { size: 13, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.12)"
+      },
+      legend: { orientation: "h", x: 0, y: 1.12, font: { size: 12, color: "#e2e8f0" } }
+    };
+
+    Plotly.react("plot-demo-bars", traces, layout, { responsive: true, displaylogo: false });
+  }
+
+  window.setLifeCurveMode = function (m) {
+    curveMode = m;
+    document.getElementById("life-est-w").classList.toggle("active", m === "w");
+    document.getElementById("life-est-u").classList.toggle("active", m === "u");
+    renderLifespanCurve();
+  };
+
+  window.setLifeMatrixMode = function (m) {
+    matMode = m;
+    document.getElementById("mat-est-w").classList.toggle("active", m === "w");
+    document.getElementById("mat-est-u").classList.toggle("active", m === "u");
+    renderLifespanMatrix();
+  };
+
+  window.setDemoMode = function (m) {
+    demoMode = m;
+    document.getElementById("demo-est-w").classList.toggle("active", m === "w");
+    document.getElementById("demo-est-u").classList.toggle("active", m === "u");
+    renderDemoBars();
+  };
+
+  document.addEventListener("DOMContentLoaded", function () {
+    renderLifespanCurve();
+    renderLifespanMatrix();
+    renderDemoBars();
+  });
+})();
+</script>
+```

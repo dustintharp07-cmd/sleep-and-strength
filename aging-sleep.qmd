@@ -1,0 +1,705 @@
+---
+title: "Aging & Sleep Quality — Sleep & Physical Strength"
+---
+
+```{r}
+library(tidyverse)
+library(haven)
+library(survey)
+library(splines)
+library(broom)
+library(plotly)
+library(jsonlite)
+library(scales)
+
+fmt1 <- \(x) sprintf("%.1f", x)
+fmt2 <- \(x) sprintf("%.2f", x)
+fmt_signed <- \(x, digits = 2) sprintf(paste0("%+.", digits, "f"), x)
+
+# 1. Load preserved 10,987-participant dataset + construct verified NHANES MEC design
+df <- read_rds("data/processed/nhanes_sleep_strength.rds") |>
+  mutate(
+    sleep_cat_ref = relevel(sleep_category, ref = "Recommended (7-8h)"),
+    pir_tier = case_when(
+      is.na(income_pir) ~ NA_character_,
+      income_pir < 1.0 ~ "<1.0 (Below Poverty)",
+      income_pir < 2.0 ~ "1.0–1.99 (Near Poverty)",
+      income_pir < 4.0 ~ "2.0–3.99 (Middle Income)",
+      income_pir >= 4.0 ~ "4.0–5.0 (Higher Income)"
+    ) |> factor(levels = c(
+      "<1.0 (Below Poverty)",
+      "1.0–1.99 (Near Poverty)",
+      "2.0–3.99 (Middle Income)",
+      "4.0–5.0 (Higher Income)"
+    ))
+  )
+
+demo_mec <- bind_rows(
+  read_xpt("data/raw/DEMO_G.XPT") |> select(SEQN, SDMVPSU, SDMVSTRA, WTMEC2YR),
+  read_xpt("data/raw/DEMO_H.XPT") |> select(SEQN, SDMVPSU, SDMVSTRA, WTMEC2YR)
+) |>
+  filter(WTMEC2YR > 0) |>
+  mutate(mec_weight_4yr = WTMEC2YR / 2) |>
+  left_join(df |> select(-mec_weight_4yr) |> mutate(in_cohort = TRUE), by = "SEQN") |>
+  mutate(in_cohort = coalesce(in_cohort, FALSE))
+
+des_mec_full <- svydesign(
+  id = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~mec_weight_4yr,
+  nest = TRUE, data = demo_mec
+)
+des_analytic <- subset(des_mec_full, in_cohort)
+
+n_total <- nrow(df)
+
+# Missingness accounting across secondary variables
+n_ts_valid <- sum(!is.na(df$trouble_sleeping))
+n_ts_miss  <- sum(is.na(df$trouble_sleeping))
+n_sd_valid <- sum(!is.na(df$sleep_disorder))
+n_sd_miss  <- sum(is.na(df$sleep_disorder))
+n_pir_valid <- sum(!is.na(df$income_pir))
+n_pir_miss  <- sum(is.na(df$income_pir))
+pct_pir_miss <- round(n_pir_miss / n_total * 100, 1)
+
+# 2. Figure 3.1: Within-Stage Survey-Weighted Contrasts (<=5h vs 7-8h AND 9+h vs 7-8h)
+stage_contrasts <- map_dfr(levels(df$age_group), \(ag) {
+  d_sub <- subset(des_analytic, age_group == ag)
+  sub_df <- df |> filter(age_group == ag)
+  m_sub <- svyglm(combined_grip_kg ~ sleep_cat_ref + sex * poly(age, 2), design = d_sub)
+  tidy(m_sub, conf.int = TRUE) |>
+    filter(term %in% c("sleep_cat_refVery Short (<=5h)", "sleep_cat_refLong (9+h)")) |>
+    mutate(
+      age_group = ag,
+      contrast = if_else(str_detect(term, "Very Short"), "Very Short (≤5h) vs. 7–8h", "Long (9+h) vs. 7–8h"),
+      n_stage = nrow(sub_df),
+      n_group = if_else(
+        str_detect(term, "Very Short"),
+        sum(sub_df$sleep_category == "Very Short (<=5h)"),
+        sum(sub_df$sleep_category == "Long (9+h)")
+      ),
+      est = round(estimate, 2),
+      lo = round(conf.low, 2),
+      hi = round(conf.high, 2),
+      pval = p.value
+    ) |>
+    select(age_group, contrast, n_stage, n_group, est, lo, hi, pval)
+})
+
+c_60_9h <- stage_contrasts |> filter(age_group == "60-74", str_starts(contrast, "Long"))
+c_75_9h <- stage_contrasts |> filter(age_group == "75-80+", str_starts(contrast, "Long"))
+
+# 3. Figure 3.2: Sleep Quality Indicators (SLQ050 Trouble Sleeping & SLQ060 Sleep Disorder)
+m_ts_svy <- svyglm(
+  combined_grip_kg ~ trouble_sleeping + sex * ns(age, df = 5),
+  design = subset(des_analytic, !is.na(trouble_sleeping))
+)
+td_ts <- tidy(m_ts_svy, conf.int = TRUE) |> filter(term == "trouble_sleepingYes")
+
+m_sd_svy <- svyglm(
+  combined_grip_kg ~ sleep_disorder + sex * ns(age, df = 5),
+  design = subset(des_analytic, !is.na(sleep_disorder))
+)
+td_sd <- tidy(m_sd_svy, conf.int = TRUE) |> filter(term == "sleep_disorderYes")
+
+build_quality_profile <- \(var_name) {
+  d_valid <- subset(des_analytic, !is.na(get(var_name)))
+  fml_by <- as.formula(paste0("~age_group + sex + ", var_name))
+  svy_q <- svyby(~combined_grip_kg, fml_by, design = d_valid, FUN = svymean, vartype = "ci") |>
+    as_tibble() |>
+    rename(status = all_of(var_name), w_mean = combined_grip_kg, w_lo = ci_l, w_hi = ci_u)
+
+  unw_q <- df |>
+    filter(!is.na(.data[[var_name]])) |>
+    group_by(age_group, sex, status = .data[[var_name]]) |>
+    summarise(n = n(), u_mean = mean(combined_grip_kg), .groups = "drop")
+
+  unw_q |>
+    left_join(svy_q, by = c("age_group", "sex", "status")) |>
+    mutate(
+      age_group = as.character(age_group),
+      sex = as.character(sex),
+      status = as.character(status),
+      across(c(u_mean, w_mean, w_lo, w_hi), \(v) round(v, 1))
+    )
+}
+
+quality_profiles <- list(
+  ts = build_quality_profile("trouble_sleeping"),
+  sd = build_quality_profile("sleep_disorder")
+)
+
+# 4. Figure 3.3: Socioeconomic Context (INDFMPIR, n = 10,119 valid, 868 missing)
+des_pir <- subset(des_analytic, !is.na(income_pir))
+m_pir_svy <- svyglm(
+  combined_grip_kg ~ income_pir + sleep_cat_ref + sex * ns(age, df = 5),
+  design = des_pir
+)
+td_pir <- tidy(m_pir_svy, conf.int = TRUE)
+pir_slope <- td_pir |> filter(term == "income_pir")
+pir_5h    <- td_pir |> filter(term == "sleep_cat_refVery Short (<=5h)")
+pir_6h    <- td_pir |> filter(term == "sleep_cat_refShort (6h)")
+pir_9h    <- td_pir |> filter(term == "sleep_cat_refLong (9+h)")
+
+svy_pir_tiers <- svyby(
+  ~combined_grip_kg, ~sex + pir_tier,
+  design = des_pir, FUN = svymean, vartype = "ci"
+) |>
+  as_tibble() |>
+  rename(w_mean = combined_grip_kg, w_lo = ci_l, w_hi = ci_u)
+
+pir_profile <- df |>
+  filter(!is.na(pir_tier)) |>
+  group_by(sex, pir_tier) |>
+  summarise(
+    n = n(),
+    u_mean = mean(combined_grip_kg),
+    u_se = sd(combined_grip_kg) / sqrt(n()),
+    u_lo = u_mean - qt(0.975, pmax(n() - 1L, 1L)) * u_se,
+    u_hi = u_mean + qt(0.975, pmax(n() - 1L, 1L)) * u_se,
+    .groups = "drop"
+  ) |>
+  left_join(svy_pir_tiers, by = c("sex", "pir_tier")) |>
+  mutate(
+    sex = as.character(sex),
+    pir_tier = as.character(pir_tier),
+    across(c(u_mean, u_lo, u_hi, w_mean, w_lo, w_hi), \(v) round(v, 1))
+  )
+
+aging_payload <- toJSON(
+  list(
+    contrasts = stage_contrasts,
+    quality = quality_profiles,
+    pir = pir_profile
+  ),
+  dataframe = "columns",
+  auto_unbox = TRUE
+)
+
+dep_widget <- plot_ly() |>
+  config(displayModeBar = FALSE) |>
+  htmlwidgets::onRender("function(el) { el.style.display = 'none'; }")
+```
+
+```{r}
+dep_widget
+```
+
+<div class="platform-shell">
+
+<!-- CHAPTER HEADER -->
+<section class="hero-section" style="padding: 2.15rem 2.3rem;">
+<div class="eyebrow-badge">
+Chapter 3 &middot; Lifelong Physical Functioning &middot; Sleep Quality &amp; Confounding
+</div>
+<h1 class="hero-title" style="font-size: clamp(1.85rem, 3.4vw, 2.75rem);">
+Across the Lifespan: <span class="gradient-text">Sleep Quality &amp; Functional Aging</span>
+</h1>
+<p class="hero-subtitle" style="margin-bottom: 1.1rem;">
+Clinical research establishes handgrip dynamometry as an indicator of overall muscle strength and a predictor of physical disability and health trajectories, particularly in middle and older adulthood (<a href="about.html#references" style="color: #38bdf8; text-decoration: none;">Bohannon, 2019</a>; <a href="about.html#references" style="color: #38bdf8; text-decoration: none;">Dodds et al., 2014</a>). Building on that clinical context, we test where across all five NHANES age groups (`16–80+`) long sleep (`9+h`) diverges from `7–8h`, evaluate subjective sleep complaints (`SLQ050`) and diagnosed sleep disorders (`SLQ060`), and check household socioeconomic covariate sensitivity (`INDFMPIR`).
+</p>
+
+<div class="rq-callout">
+<div class="rq-label">Chapter 3 Analytical Takeaway</div>
+<p class="rq-question">
+Across ages `16–59`, neither short (`&le;5h`) nor long (`9+h`) sleep differs significantly from `7–8h` in survey-weighted models; the `9+h` strength deficit appears specifically in ages `60–74` (`r fmt_signed(c_60_9h$est)` kg) and `75–80+` (`r fmt_signed(c_75_9h$est)` kg), while reported sleep trouble and diagnosed sleep disorders show null adjusted associations overall.
+</p>
+</div>
+</section>
+
+<!-- KPI STRIP -->
+<section class="kpi-grid">
+<div class="kpi-card">
+<div class="kpi-label">9+h vs. 7–8h (Ages 60–74)</div>
+<div class="kpi-value accent-cyan">`r fmt_signed(c_60_9h$est)` kg</div>
+<div class="kpi-sub">Survey-weighted adjusted diff (`p = `r sprintf("%.4f", c_60_9h$pval)``; `n = `r comma(c_60_9h$n_stage)``)</div>
+</div>
+<div class="kpi-card">
+<div class="kpi-label">9+h vs. 7–8h (Ages 75–80+)</div>
+<div class="kpi-value accent-teal">`r fmt_signed(c_75_9h$est)` kg</div>
+<div class="kpi-sub">Survey-weighted adjusted diff (`p = `r sprintf("%.4f", c_75_9h$pval)``; `n = `r comma(c_75_9h$n_stage)``)</div>
+</div>
+<div class="kpi-card">
+<div class="kpi-label">Sleep Trouble (`SLQ050`)</div>
+<div class="kpi-value accent-blue">`r fmt_signed(td_ts$estimate)` kg</div>
+<div class="kpi-sub">Survey-weighted age/sex-adjusted diff (`p = `r fmt2(td_ts$p.value)``; `n = `r comma(n_ts_valid)``)</div>
+</div>
+<div class="kpi-card">
+<div class="kpi-label">Income-to-Poverty Gradient</div>
+<div class="kpi-value accent-violet">`r fmt_signed(pir_slope$estimate)` kg/PIR</div>
+<div class="kpi-sub">`p < 0.0001` across `n = `r comma(n_pir_valid)`` (`r comma(n_pir_miss)` missing `INDFMPIR`)</div>
+</div>
+</section>
+
+<!-- FIGURE 3.1: LIFE-STAGE INTERACTION FOREST PLOT -->
+<section class="glass-card">
+<div class="method-badge-row">
+<span class="method-badge badge-weighted">
+Within-Stage Survey-Weighted GLM (Adjusted for Sex &times; Quadratic Age)
+</span>
+<span class="method-badge badge-sample">
+All Five Lifespan Stages (Ages 16–80+): N = `r comma(n_total)` (0 Missing)
+</span>
+</div>
+
+<div class="section-header" style="margin-bottom: 0.85rem;">
+<div style="max-width: 900px;">
+<h2 class="section-title">
+Long Sleep (9+h) Shows Negligible Strength Differences From Ages 16 Through 59, Diverging Significantly Only After Age 60
+</h2>
+<p class="section-desc">
+Survey-weighted adjusted differences (`kg`, &plusmn;95% CI) comparing <strong>Very Short (&le;5h)</strong> and <strong>Long (9+h)</strong> sleepers against <strong>Recommended (7–8h)</strong> peers within each life stage.
+</p>
+</div>
+</div>
+
+<div id="plot-stage-contrasts" style="width: 100%; height: 430px;"></div>
+
+<div class="finding-note">
+<strong>Observational interpretation vs. prior epidemiological literature:</strong> Because NHANES is cross-sectional, the lower grip strength observed here among older `9+h` sleepers (`r fmt_signed(c_60_9h$est)` kg in `60–74`; `r fmt_signed(c_75_9h$est)` kg in `75–80+`) does <em>not</em> show that sleeping 9+ hours weakens muscle. Prior epidemiological investigations demonstrate that habitual long sleep (`&ge;9h`) frequently co-occurs with chronic medical conditions, depressive symptoms, sedative/antidepressant medication use, or recovery from illness (<a href="about.html#references" style="color: #38bdf8; text-decoration: none;">Patel et al., 2006</a>; <a href="about.html#references" style="color: #38bdf8; text-decoration: none;">Watson et al., 2015</a>)—factors not controlled in these models that can independently reduce physical strength and increase time spent sleeping.
+</div>
+</section>
+
+<!-- FIGURE 3.2: SLEEP TROUBLE (SLQ050) & SLEEP DISORDERS (SLQ060) -->
+<section class="glass-card">
+<div class="method-badge-row">
+<span class="method-badge badge-weighted">
+NHANES Survey-Weighted Means (95% CI)
+</span>
+<span class="method-badge badge-sample" id="quality-sample-badge">
+SLQ050 Analytical Sample: n = `r comma(n_ts_valid)` of `r comma(n_total)` (`r n_ts_miss` Missing Excluded)
+</span>
+</div>
+
+<div class="section-header" style="margin-bottom: 0.85rem;">
+<div style="max-width: 880px;">
+<h2 class="section-title" id="quality-chart-title">
+Self-Reported Sleep Trouble (`SLQ050`) and Diagnosed Sleep Disorders (`SLQ060`) Show No Meaningful Independent Association With Grip Strength Once Age and Sex Are Controlled
+</h2>
+<p class="section-desc" id="quality-chart-desc">
+Survey-weighted mean grip strength (&plusmn;95% CI) across all five life stages for examinees who reported telling a doctor they had trouble sleeping (`Yes` vs. `No`). Toggle to inspect physician-diagnosed sleep disorders (`SLQ060`).
+</p>
+</div>
+<div class="control-bar">
+<button class="pill-btn active" id="qual-btn-ts" onclick="setQualityVar('ts')">Trouble Sleeping (`SLQ050`, n = `r comma(n_ts_valid)`)</button>
+<button class="pill-btn" id="qual-btn-sd" onclick="setQualityVar('sd')">Sleep Disorder (`SLQ060`, n = `r comma(n_sd_valid)`)</button>
+</div>
+</div>
+
+<div id="plot-sleep-quality" style="width: 100%; height: 470px;"></div>
+
+<div class="finding-note">
+<strong>Reporting null findings transparently:</strong> Across all `r comma(n_ts_valid)` examinees with valid `SLQ050` responses (`r n_ts_miss` refused/don't know), reporting sleep trouble is associated with just `r fmt_signed(td_ts$estimate)` kg (`95% CI [`r fmt_signed(td_ts$conf.low)`, `r fmt_signed(td_ts$conf.high)`]`, `p = `r fmt2(td_ts$p.value)``) after accounting for sex, nonlinear age, and NHANES survey design. Similarly, across `r comma(n_sd_valid)` valid `SLQ060` responses (`r n_sd_miss` missing), a diagnosed sleep disorder shows `r fmt_signed(td_sd$estimate)` kg (`95% CI [`r fmt_signed(td_sd$conf.low)`, `r fmt_signed(td_sd$conf.high)`]`, `p = `r fmt2(td_sd$p.value)``). Unadjusted differences in pooled summaries arise largely because sleep complaints become more common in middle and older age.
+</div>
+</section>
+
+<!-- FIGURE 3.3: SOCIOECONOMIC CONTEXT (INDFMPIR) WITH EXPLICIT MISSINGNESS -->
+<section class="glass-card">
+<div class="method-badge-row">
+<span class="method-badge badge-weighted" id="pir-mode-badge">
+NHANES Survey-Weighted Means (95% CI)
+</span>
+<span class="method-badge badge-sample">
+INDFMPIR Complete-Case Slice: n = `r comma(n_pir_valid)` of `r comma(n_total)` (`r comma(n_pir_miss)` [`r fmt1(pct_pir_miss)`%] Missing Excluded)
+</span>
+</div>
+
+<div class="section-header" style="margin-bottom: 0.85rem;">
+<div style="max-width: 880px;">
+<h2 class="section-title">
+Higher Household Income-to-Poverty Ratio Aligns With Modestly Stronger Grip (`r fmt_signed(pir_slope$estimate)` kg per PIR Unit), Without Explaining Away the 9+h Association
+</h2>
+<p class="section-desc">
+Combined grip strength (&plusmn;95% CI) across four CDC family poverty-income ratio (`INDFMPIR`) tiers separated by sex. Participants missing household income (`n = `r comma(n_pir_miss)``) are explicitly excluded rather than imputed.
+</p>
+</div>
+<div class="control-bar">
+<button class="pill-btn active" id="pir-est-w" onclick="setPirMode('w')">Survey-Weighted</button>
+<button class="pill-btn" id="pir-est-u" onclick="setPirMode('u')">Unweighted Sample</button>
+</div>
+</div>
+
+<div id="plot-pir-gradient" style="width: 100%; height: 420px;"></div>
+
+<div class="finding-note">
+<strong>Socioeconomic sensitivity check:</strong> Adding continuous `INDFMPIR` (`n = `r comma(n_pir_valid)``) to our survey-weighted `sex * ns(age, df = 5)` regression confirms a positive socioeconomic gradient (`r fmt_signed(pir_slope$estimate)` kg per PIR unit, `95% CI [`r fmt_signed(pir_slope$conf.low)`, `r fmt_signed(pir_slope$conf.high)`]`, `p < 0.0001`), while short sleep remains null (`&le;5h`: `r fmt_signed(pir_5h$estimate)` kg, `p = `r fmt2(pir_5h$p.value)``; `6h`: `r fmt_signed(pir_6h$estimate)` kg, `p = `r fmt2(pir_6h$p.value)``) and `Long (9+h)` remains `r fmt_signed(pir_9h$estimate)` kg (`95% CI [`r fmt_signed(pir_9h$conf.low)`, `r fmt_signed(pir_9h$conf.high)`]`, `p = `r sprintf("%.4f", pir_9h$p.value)``). Unmerged NHANES modules—such as body anthropometric measures (`BMX`) and physical activity (`PAQ`)—remain outside this three-module dataset and represent important covariates for future work.
+</div>
+</section>
+
+<!-- NAVIGATION PORTALS -->
+<section class="info-grid-2">
+<a class="nav-portal-card" href="lifespan.html">
+<div class="section-kicker">Previous Chapter</div>
+<h3 style="font-size: 1.18rem; font-weight: 700; color: #f8fafc; margin: 0.2rem 0 0.35rem 0;">
+&larr; Chapter 2: Biological Sex &amp; Lifespan Arc
+</h3>
+<p style="font-size: 0.89rem; color: #cbd5e1; margin: 0;">
+Review the `16–80+` lifespan curve, discrete Age &times; Sleep matrices, and `RIDRETH3` sampling structure.
+</p>
+</a>
+
+<a class="nav-portal-card" href="explore.html">
+<div class="section-kicker">Interactive Laboratory</div>
+<h3 style="font-size: 1.18rem; font-weight: 700; color: #f8fafc; margin: 0.2rem 0 0.35rem 0;">
+Open Interactive Data Explorer &rarr;
+</h3>
+<p style="font-size: 0.89rem; color: #cbd5e1; margin: 0;">
+Test custom combinations of age, sleep category, sex, demographics, sleep trouble, and single-hand vs. bilateral grip.
+</p>
+</a>
+</section>
+
+</div>
+
+```{r}
+#| results: asis
+cat(paste0("<script>const AGING_DATA = ", aging_payload, ";</script>\n"))
+```
+
+```{=html}
+<script>
+(function () {
+  let qualVar = "ts";
+  let pirMode = "w";
+
+  function renderStageContrasts() {
+    const C = AGING_DATA.contrasts;
+    const stages = ["16-29", "30-44", "45-59", "60-74", "75-80+"];
+    const specs = [
+      { name: "Very Short (≤5h) vs. 7–8h", color: "#38bdf8", offset: -0.11, symbol: "circle" },
+      { name: "Long (9+h) vs. 7–8h", color: "#a78bfa", offset: 0.11, symbol: "diamond" }
+    ];
+
+    const zeroLine = {
+      type: "scatter",
+      mode: "lines",
+      x: [-0.45, 4.45],
+      y: [0, 0],
+      line: { color: "rgba(248,250,252,0.55)", width: 1.6, dash: "dash" },
+      hoverinfo: "skip",
+      showlegend: false
+    };
+
+    const traces = [zeroLine];
+
+    specs.forEach(sp => {
+      const xs = [];
+      const ys = [];
+      const hiArr = [];
+      const loArr = [];
+      const cdata = [];
+
+      stages.forEach((ag, sIdx) => {
+        for (let i = 0; i < C.age_group.length; i++) {
+          if (C.age_group[i] === ag && C.contrast[i] === sp.name) {
+            xs.push(sIdx + sp.offset);
+            ys.push(C.est[i]);
+            hiArr.push(Number((C.hi[i] - C.est[i]).toFixed(2)));
+            loArr.push(Number((C.est[i] - C.lo[i]).toFixed(2)));
+            cdata.push([
+              ag,
+              C.n_group[i],
+              C.n_stage[i],
+              C.lo[i].toFixed(2),
+              C.hi[i].toFixed(2),
+              C.pval[i].toFixed(4)
+            ]);
+          }
+        }
+      });
+
+      traces.push({
+        type: "scatter",
+        mode: "markers",
+        name: sp.name,
+        x: xs,
+        y: ys,
+        customdata: cdata,
+        marker: {
+          size: 10.5,
+          symbol: sp.symbol,
+          color: sp.color,
+          line: { color: "#ffffff", width: 1.6 }
+        },
+        error_y: {
+          type: "data",
+          symmetric: false,
+          array: hiArr,
+          arrayminus: loArr,
+          visible: true,
+          color: sp.color,
+          thickness: 2.2,
+          width: 5
+        },
+        hovertemplate:
+          "<b>Ages %{customdata[0]} &middot; " + sp.name + "</b><br>" +
+          "Adjusted Difference: <b>%{y:+.2f} kg</b> [95% CI: %{customdata[3]} to %{customdata[4]} kg]<br>" +
+          "Tier Count: n = %{customdata[1]} (within stage N = %{customdata[2]}) &middot; p = %{customdata[5]}<extra></extra>"
+      });
+    });
+
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 28, r: 24, b: 64, l: 72 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: {
+        range: [-0.45, 4.45],
+        tickvals: [0, 1, 2, 3, 4],
+        ticktext: stages.map(s => "Ages " + s),
+        tickfont: { size: 12.5, color: "#f8fafc" },
+        title: { text: "Lifespan Age Group (Survey-Weighted Within-Stage Contrasts, Ages 16–80+)", font: { size: 12.5, color: "#cbd5e1" } },
+        gridcolor: "rgba(148,163,184,0.08)",
+        zeroline: false
+      },
+      yaxis: {
+        range: [-7.5, 5.0],
+        title: { text: "Adjusted Grip Difference vs. 7–8h (kg)", font: { size: 13, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.12)",
+        zeroline: false
+      },
+      legend: { orientation: "h", x: 0, y: 1.12, font: { size: 12, color: "#e2e8f0" } }
+    };
+
+    Plotly.react("plot-stage-contrasts", traces, layout, { responsive: true, displaylogo: false });
+  }
+
+  function buildQualitySide(sexName, axisSuffix) {
+    const Q = AGING_DATA.quality[qualVar];
+    const stages = ["16-29", "30-44", "45-59", "60-74", "75-80+"];
+    const yesLabel = qualVar === "ts" ? "Reported Sleep Trouble (Yes)" : "Diagnosed Disorder (Yes)";
+    const noLabel = qualVar === "ts" ? "No Sleep Trouble (No)" : "No Diagnosed Disorder (No)";
+
+    const groups = [
+      { status: "No", label: sexName + " · " + noLabel, color: sexName === "Male" ? "#38bdf8" : "#f472b6", offset: -0.11 },
+      { status: "Yes", label: sexName + " · " + yesLabel, color: sexName === "Male" ? "#fbbf24" : "#a78bfa", offset: 0.11 }
+    ];
+
+    return groups.map(g => {
+      const xs = [];
+      const ys = [];
+      const hiArr = [];
+      const loArr = [];
+      const cdata = [];
+
+      stages.forEach((ag, sIdx) => {
+        for (let i = 0; i < Q.age_group.length; i++) {
+          if (Q.age_group[i] === ag && Q.sex[i] === sexName && Q.status[i] === g.status) {
+            xs.push(sIdx + g.offset);
+            ys.push(Q.w_mean[i]);
+            hiArr.push(Number((Q.w_hi[i] - Q.w_mean[i]).toFixed(2)));
+            loArr.push(Number((Q.w_mean[i] - Q.w_lo[i]).toFixed(2)));
+            cdata.push([ag, Q.n[i], Q.w_lo[i].toFixed(1), Q.w_hi[i].toFixed(1), Q.u_mean[i].toFixed(1)]);
+          }
+        }
+      });
+
+      return {
+        type: "scatter",
+        mode: "markers",
+        name: g.label,
+        xaxis: "x" + axisSuffix,
+        yaxis: "y" + axisSuffix,
+        x: xs,
+        y: ys,
+        customdata: cdata,
+        marker: {
+          size: 9.5,
+          symbol: g.status === "Yes" ? "diamond" : "circle",
+          color: g.color,
+          line: { color: "#ffffff", width: 1.4 }
+        },
+        error_y: {
+          type: "data",
+          symmetric: false,
+          array: hiArr,
+          arrayminus: loArr,
+          visible: true,
+          color: g.color,
+          thickness: 2,
+          width: 4
+        },
+        hovertemplate:
+          "<b>" + g.label + " &middot; Ages %{customdata[0]}</b> (n = %{customdata[1]})<br>" +
+          "Survey-Weighted Mean: <b>%{y:.1f} kg</b> [95% CI: %{customdata[2]}–%{customdata[3]} kg]<br>" +
+          "Unweighted Sample Mean: %{customdata[4]} kg<extra></extra>"
+      };
+    });
+  }
+
+  function renderSleepQuality() {
+    const stages = ["16–29", "30–44", "45–59", "60–74", "75–80+"];
+    const badge = document.getElementById("quality-sample-badge");
+    if (qualVar === "ts") {
+      badge.textContent = "SLQ050 Analytical Sample: n = 10,986 of 10,987 (1 Missing Excluded)";
+    } else {
+      badge.textContent = "SLQ060 Analytical Sample: n = 10,973 of 10,987 (14 Missing Excluded)";
+    }
+
+    const mTraces = buildQualitySide("Male", "");
+    const fTraces = buildQualitySide("Female", "2");
+
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 52, r: 22, b: 68, l: 64 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: {
+        domain: [0, 0.47],
+        range: [-0.48, 4.48],
+        tickvals: [0, 1, 2, 3, 4],
+        ticktext: stages,
+        title: { text: "Male Age Group (Years)", font: { size: 12, color: "#cbd5e1" } },
+        gridcolor: "rgba(148,163,184,0.10)"
+      },
+      yaxis: {
+        range: [32, 106],
+        title: { text: "Combined Bilateral Grip Strength (kg)", font: { size: 13, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.12)"
+      },
+      xaxis2: {
+        domain: [0.53, 1.0],
+        anchor: "y2",
+        range: [-0.48, 4.48],
+        tickvals: [0, 1, 2, 3, 4],
+        ticktext: stages,
+        title: { text: "Female Age Group (Years)", font: { size: 12, color: "#cbd5e1" } },
+        gridcolor: "rgba(148,163,184,0.10)"
+      },
+      yaxis2: {
+        anchor: "x2",
+        matches: "y",
+        range: [32, 106],
+        tickfont: { color: "#94a3b8" },
+        gridcolor: "rgba(148,163,184,0.12)"
+      },
+      annotations: [
+        {
+          xref: "paper", yref: "paper", x: 0.235, y: 1.07,
+          xanchor: "center", yanchor: "bottom", showarrow: false,
+          text: "<b style='color:#7dd3fc;font-size:13.5px'>MALES BY SLEEP SYMPTOM STATUS</b>"
+        },
+        {
+          xref: "paper", yref: "paper", x: 0.765, y: 1.07,
+          xanchor: "center", yanchor: "bottom", showarrow: false,
+          text: "<b style='color:#f9a8d4;font-size:13.5px'>FEMALES BY SLEEP SYMPTOM STATUS</b>"
+        }
+      ],
+      legend: { orientation: "h", x: 0, y: -0.18, font: { size: 11.2, color: "#e2e8f0" } }
+    };
+
+    Plotly.react("plot-sleep-quality", mTraces.concat(fTraces), layout, { responsive: true, displaylogo: false });
+  }
+
+  function renderPirGradient() {
+    const P = AGING_DATA.pir;
+    const tiers = [
+      "<1.0 (Below Poverty)",
+      "1.0–1.99 (Near Poverty)",
+      "2.0–3.99 (Middle Income)",
+      "4.0–5.0 (Higher Income)"
+    ];
+    const badge = document.getElementById("pir-mode-badge");
+    if (pirMode === "w") {
+      badge.className = "method-badge badge-weighted";
+      badge.textContent = "NHANES Survey-Weighted Means (95% CI)";
+    } else {
+      badge.className = "method-badge badge-descriptive";
+      badge.textContent = "Unweighted Sample Means (95% CI)";
+    }
+
+    const sexConfigs = [
+      { sex: "Male", color: "#38bdf8", offset: -0.10 },
+      { sex: "Female", color: "#f472b6", offset: 0.10 }
+    ];
+
+    const traces = sexConfigs.map(cfg => {
+      const xs = [];
+      const ys = [];
+      const hiArr = [];
+      const loArr = [];
+      const cdata = [];
+
+      tiers.forEach((tr, tIdx) => {
+        for (let i = 0; i < P.sex.length; i++) {
+          if (P.sex[i] === cfg.sex && P.pir_tier[i] === tr) {
+            const m = pirMode === "w" ? P.w_mean[i] : P.u_mean[i];
+            const lo = pirMode === "w" ? P.w_lo[i] : P.u_lo[i];
+            const hi = pirMode === "w" ? P.w_hi[i] : P.u_hi[i];
+            xs.push(tIdx + cfg.offset);
+            ys.push(m);
+            hiArr.push(Number((hi - m).toFixed(2)));
+            loArr.push(Number((m - lo).toFixed(2)));
+            cdata.push([tr, P.n[i], lo.toFixed(1), hi.toFixed(1)]);
+          }
+        }
+      });
+
+      return {
+        type: "scatter",
+        mode: "markers",
+        name: cfg.sex,
+        x: xs,
+        y: ys,
+        customdata: cdata,
+        marker: { size: 10.5, color: cfg.color, line: { color: "#ffffff", width: 1.8 } },
+        error_y: {
+          type: "data",
+          symmetric: false,
+          array: hiArr,
+          arrayminus: loArr,
+          visible: true,
+          color: cfg.color,
+          thickness: 2.2,
+          width: 5
+        },
+        hovertemplate:
+          "<b>" + cfg.sex + " &middot; PIR %{customdata[0]}</b> (n = %{customdata[1]})<br>" +
+          "Mean Grip: <b>%{y:.1f} kg</b> [95% CI: %{customdata[2]}–%{customdata[3]} kg]<extra></extra>"
+      };
+    });
+
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(8,13,26,0.72)",
+      margin: { t: 28, r: 24, b: 64, l: 68 },
+      font: { family: "Inter, system-ui, sans-serif", color: "#cbd5e1" },
+      xaxis: {
+        range: [-0.45, 3.45],
+        tickvals: [0, 1, 2, 3],
+        ticktext: tiers,
+        tickfont: { size: 12, color: "#f8fafc" },
+        title: { text: "Household Family Income-to-Poverty Ratio Tier (INDFMPIR)", font: { size: 12.5, color: "#cbd5e1" } },
+        gridcolor: "rgba(148,163,184,0.08)"
+      },
+      yaxis: {
+        range: [45, 100],
+        title: { text: "Combined Bilateral Grip Strength (kg)", font: { size: 13, color: "#f8fafc" } },
+        gridcolor: "rgba(148,163,184,0.12)"
+      },
+      legend: { orientation: "h", x: 0, y: 1.12, font: { size: 12, color: "#e2e8f0" } }
+    };
+
+    Plotly.react("plot-pir-gradient", traces, layout, { responsive: true, displaylogo: false });
+  }
+
+  window.setQualityVar = function (v) {
+    qualVar = v;
+    document.getElementById("qual-btn-ts").classList.toggle("active", v === "ts");
+    document.getElementById("qual-btn-sd").classList.toggle("active", v === "sd");
+    renderSleepQuality();
+  };
+
+  window.setPirMode = function (m) {
+    pirMode = m;
+    document.getElementById("pir-est-w").classList.toggle("active", m === "w");
+    document.getElementById("pir-est-u").classList.toggle("active", m === "u");
+    renderPirGradient();
+  };
+
+  document.addEventListener("DOMContentLoaded", function () {
+    renderStageContrasts();
+    renderSleepQuality();
+    renderPirGradient();
+  });
+})();
+</script>
+```
